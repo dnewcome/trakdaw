@@ -61,7 +61,11 @@ target_compile_definitions(trakdaw PRIVATE
     JUCE_STRICT_REFCOUNTEDPOINTER=1
     JUCE_MODAL_LOOPS_PERMITTED=1
     TRACKTION_ENABLE_TIMESTRETCH_SOUNDTOUCH=0
-    SOL_ALL_SAFETIES_ON=1)
+    SOL_ALL_SAFETIES_ON=1
+    JUCE_USE_WINRT_MIDI=0
+    JUCE_JACK=1
+    JUCE_ALSA=0
+    JUCE_PULSEAUDIO=0)
 
 target_link_libraries(trakdaw PRIVATE
     tracktion::tracktion_engine
@@ -74,5 +78,7 @@ target_link_libraries(trakdaw PRIVATE
     pybind11::embed)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_link_libraries(trakdaw PRIVATE "-latomic")
+    pkg_check_modules(JACK REQUIRED jack)
+    target_include_directories(trakdaw PRIVATE ${JACK_INCLUDE_DIRS})
+    target_link_libraries(trakdaw PRIVATE "-latomic" ${JACK_LIBRARIES})
 endif()

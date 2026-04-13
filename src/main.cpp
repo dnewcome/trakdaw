@@ -448,6 +448,96 @@ static void registerDawApi (sol::state& lua,
         return edit.getTransport().isPlaying();
     });
 
+    daw.set_function ("list_audio_devices", [&edit]() {
+        auto& adm = edit.engine.getDeviceManager().deviceManager;
+        for (auto* type : adm.getAvailableDeviceTypes())
+        {
+            std::cout << "Type: " << type->getTypeName() << "\n";
+            for (auto& name : type->getDeviceNames (false))
+                std::cout << "  out: " << name << "\n";
+        }
+    });
+
+    // daw.load_4osc(trackIdx) — insert Tracktion's built-in 4-oscillator synth
+    daw.set_function ("load_4osc", [&edit](int trackIdx) -> bool {
+        struct Args { te::Edit* edit; int idx; bool ok; };
+        Args args { &edit, trackIdx, false };
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread ([] (void* ctx) -> void*
+        {
+            auto* a      = static_cast<Args*> (ctx);
+            auto  tracks = te::getAudioTracks (*a->edit);
+            if (a->idx < 1 || a->idx > (int) tracks.size()) return nullptr;
+            auto* at = tracks[a->idx - 1];
+            juce::ValueTree vt (te::IDs::PLUGIN);
+            vt.setProperty (te::IDs::type, te::FourOscPlugin::xmlTypeName, nullptr);
+            at->pluginList.insertPlugin (vt, 0);
+            a->ok = true;
+            return nullptr;
+        }, &args);
+        if (args.ok)
+            std::cout << "[4osc] loaded on track " << trackIdx << "\n> " << std::flush;
+        return args.ok;
+    });
+
+    daw.set_function ("plugin_info", [&edit](int trackIdx) {
+        struct Args { te::Edit* edit; int idx; };
+        Args args { &edit, trackIdx };
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread ([](void* ctx) -> void*
+        {
+            auto* a = static_cast<Args*> (ctx);
+            auto tracks = te::getAudioTracks (*a->edit);
+            if (a->idx < 1 || a->idx > (int) tracks.size())
+                { std::cout << "(track not found)\n"; return nullptr; }
+            auto* at = tracks[a->idx - 1];
+            std::cout << "Track: " << at->getName() << "\n";
+            for (auto* plug : at->pluginList)
+            {
+                std::cout << "  Plugin: " << plug->getName() << "\n";
+                if (auto* ep = dynamic_cast<te::ExternalPlugin*> (plug))
+                {
+                    auto err = ep->getLoadError();
+                    std::cout << "    Load error: " << (err.isEmpty() ? "(none)" : err) << "\n";
+                    std::cout << "    Synth:      " << (ep->isSynth() ? "yes" : "no") << "\n";
+                }
+            }
+            return nullptr;
+        }, &args);
+    });
+
+    daw.set_function ("open_audio_device", [&edit](const std::string& name) {
+        auto& adm = edit.engine.getDeviceManager().deviceManager;
+        juce::AudioDeviceManager::AudioDeviceSetup setup;
+        adm.getAudioDeviceSetup (setup);
+        setup.outputDeviceName = name;
+        setup.sampleRate       = 48000.0;
+        setup.bufferSize       = 512;
+        setup.outputChannels.setRange (0, 2, true);
+        auto err = adm.setAudioDeviceSetup (setup, true);
+        if (err.isEmpty())
+            std::cout << "[audio] opened: " << name << "\n> " << std::flush;
+        else
+            std::cout << "[audio error] " << err << "\n> " << std::flush;
+    });
+
+    daw.set_function ("audio_info", [&edit]() {
+        auto& dm  = edit.engine.getDeviceManager();
+        auto* dev = dm.deviceManager.getCurrentAudioDevice();
+        if (dev)
+        {
+            std::cout << "Audio device:  " << dev->getName() << "\n";
+            std::cout << "Type:          " << dev->getTypeName() << "\n";
+            std::cout << "Sample rate:   " << dev->getCurrentSampleRate() << "\n";
+            std::cout << "Buffer size:   " << dev->getCurrentBufferSizeSamples() << "\n";
+            std::cout << "Out channels:  " << dev->getActiveOutputChannels().countNumberOfSetBits() << "\n";
+        }
+        else
+        {
+            std::cout << "No audio device open\n";
+        }
+        std::cout << "Transport:     " << (edit.getTransport().isPlaying() ? "playing" : "stopped") << "\n";
+        std::cout << "Position:      " << edit.getTransport().getPosition().inSeconds() << "s\n";
+    });
+
     daw.set_function ("bpm", [&edit]() -> double {
         return edit.tempoSequence.getTempo (0)->getBpm();
     });
@@ -481,7 +571,11 @@ static void registerDawApi (sol::state& lua,
                 if (slotIdx < 1 || slotIdx > sl.size()) return;
                 if (auto* c = sl[slotIdx - 1]->getClip())
                     if (auto lh = c->getLaunchHandle())
+                    {
+                        auto loopBeats = c->getEndBeat() - c->getStartBeat();
+                        lh->setLooping (loopBeats);
                         lh->play (getLaunchPosition (edit));
+                    }
             });
         };
 
@@ -539,14 +633,17 @@ static void registerDawApi (sol::state& lua,
 
     // daw.load_script(path) — execute a Lua file and start watching it for changes
     daw.set_function ("load_script", [&lua, onWatch](const std::string& path) -> bool {
-        auto result = lua.safe_script_file (path, sol::script_pass_on_error);
+        // Resolve to absolute so juce::File is happy when setting up the watcher
+        auto absFile = juce::File::getCurrentWorkingDirectory().getChildFile (path);
+        auto result = lua.safe_script_file (absFile.getFullPathName().toStdString(),
+                                            sol::script_pass_on_error);
         if (!result.valid())
         {
             sol::error err = result;
             std::cerr << "[load_script error] " << err.what() << "\n";
             return false;
         }
-        onWatch (path);
+        onWatch (absFile.getFullPathName().toStdString());
         return true;
     });
 
@@ -564,6 +661,75 @@ static void registerDawApi (sol::state& lua,
     // daw.run_python("path.py")  — execute a Python arrangement script
     daw.set_function ("run_python", [&pythonHost](const std::string& path) {
         pythonHost.runScript (path);
+    });
+
+    // --- plugin loading ---
+
+    // daw.load_plugin(trackIdx, path)
+    // Load a VST3 plugin from `path` and insert it at the front of the
+    // given track's plugin chain. trackIdx is 1-based.
+    // Returns true on success, false + prints error on failure.
+    daw.set_function ("load_plugin", [&edit](int trackIdx, const std::string& path) -> bool {
+        struct Args { te::Edit* edit; int trackIdx; std::string path; bool ok; std::string err; };
+        Args args { &edit, trackIdx, path, false, {} };
+
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread ([] (void* ctx) -> void*
+        {
+            auto* a      = static_cast<Args*> (ctx);
+            auto  tracks = te::getAudioTracks (*a->edit);
+            if (a->trackIdx < 1 || a->trackIdx > (int) tracks.size())
+            {
+                a->err = "track index out of range";
+                return nullptr;
+            }
+            auto* at = tracks[a->trackIdx - 1];
+
+            // Find a format that accepts this file
+            auto& fmgr = a->edit->engine.getPluginManager().pluginFormatManager;
+            juce::OwnedArray<juce::PluginDescription> results;
+            for (auto* fmt : fmgr.getFormats())
+            {
+                if (fmt->fileMightContainThisPluginType (a->path))
+                {
+                    fmt->findAllTypesForFile (results, a->path);
+                    if (! results.isEmpty()) break;
+                }
+            }
+
+            if (results.isEmpty())
+            {
+                a->err = "no plugin found at: " + a->path;
+                return nullptr;
+            }
+
+            std::cout << "[load_plugin] found " << results.size() << " plugin(s):\n";
+            for (auto* d : results)
+                std::cout << "  name=" << d->name
+                          << "  fmt=" << d->pluginFormatName
+                          << "  instrument=" << (int)d->isInstrument
+                          << "  uid=" << d->uniqueId << "\n";
+
+            auto vt = te::ExternalPlugin::create (a->edit->engine, *results[0]);
+            at->pluginList.insertPlugin (vt, 0);
+            // Restart playback so Tracktion rebuilds the audio graph and initialises
+            // the new plugin through the normal render path.
+            bool wasPlaying = a->edit->getTransport().isPlaying();
+            a->edit->getTransport().stop (false, false);
+            if (wasPlaying)
+                a->edit->getTransport().play (false);
+            a->ok = true;
+            return nullptr;
+        }, &args);
+
+        if (args.ok)
+        {
+            std::cout << "[load_plugin] loaded on track " << trackIdx << "\n> " << std::flush;
+        }
+        else
+        {
+            std::cerr << "[load_plugin error] " << args.err << "\n> " << std::flush;
+        }
+        return args.ok;
     });
 
     // --- follow actions ---
@@ -907,6 +1073,38 @@ public:
         // 2. Devices
         auto& dm = engine->getDeviceManager();
         dm.initialise (0, 2);
+
+        // Auto-open the first available output device (skips MIDI-only devices)
+        {
+            auto& adm = dm.deviceManager;
+            if (adm.getCurrentAudioDevice() == nullptr)
+            {
+                for (auto* type : adm.getAvailableDeviceTypes())
+                {
+                    auto names = type->getDeviceNames (false);
+                    for (auto& name : names)
+                    {
+                        if (name.containsIgnoreCase ("midi")) continue;
+                        adm.setCurrentAudioDeviceType (type->getTypeName(), true);
+                        juce::AudioDeviceManager::AudioDeviceSetup setup;
+                        adm.getAudioDeviceSetup (setup);
+                        setup.outputDeviceName = name;
+                        setup.sampleRate       = 48000.0;
+                        setup.bufferSize       = 512;
+                        setup.outputChannels.setRange (0, 2, true);
+                        auto err = adm.setAudioDeviceSetup (setup, true);
+                        if (err.isEmpty())
+                        {
+                            std::cout << "[trakdaw] Audio device: " << name << "\n";
+                            goto deviceOpened;
+                        }
+                    }
+                }
+                std::cout << "[trakdaw] WARNING: no audio output device could be opened\n";
+                deviceOpened:;
+            }
+        }
+
         std::cout << "[trakdaw] Device manager initialised\n";
 
         // 3. MIDI inputs
