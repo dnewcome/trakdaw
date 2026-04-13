@@ -1,0 +1,9 @@
+[submodule "vendor/JUCE"]
+	path = vendor/JUCE
+	url = https://github.com/juce-framework/JUCE.git
+[submodule "vendor/tracktion_engine"]
+	path = vendor/tracktion_engine
+	url = https://github.com/Tracktion/tracktion_engine.git
+[submodule "vendor/sol2"]
+	path = vendor/sol2
+	url = https://github.com/ThePhD/sol2.git

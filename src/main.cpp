@@ -1,0 +1,918 @@
+/*
+    trakdaw — Phase 5: Python Arrangement Layer
+    ---------------------------------------------
+    Builds on Phase 4 (hot reload) and adds:
+      - CPython embedded via pybind11
+      - `daw` Python module: transport, Track, MidiClip arrangement API
+      - PythonHost thread owns the interpreter; scripts queued and run serially
+      - daw.run_python("path.py") from the Lua REPL triggers a Python script
+      - Python arrangement writes timeline MIDI clips; Lua handles real-time
+*/
+
+#define SOL_ALL_SAFETIES_ON 1
+#include <sol/sol.hpp>
+
+// pybind11 must come before JuceHeader to avoid macro conflicts
+#include <pybind11/embed.h>
+#include <pybind11/stl.h>
+namespace py = pybind11;
+
+#include <JuceHeader.h>
+
+#include <sys/select.h>
+#include <unistd.h>
+#include <cmath>
+#include <mutex>
+#include <queue>
+
+namespace te = tracktion;
+using namespace tracktion::literals;
+
+//==============================================================================
+// MidiEvent — POD, safe to copy across threads
+//==============================================================================
+struct MidiEvent
+{
+    std::array<uint8_t, 4> data{};
+    int    size            = 0;
+    double receiveTimeSecs = 0.0;
+};
+
+//==============================================================================
+// MidiEventQueue — lock-free SPSC
+//   Producer: MIDI callback thread
+//   Consumer: Lua REPL thread
+//==============================================================================
+class MidiEventQueue
+{
+public:
+    static constexpr int kCapacity = 1024;
+
+    bool push (const MidiEvent& e)
+    {
+        int s1, n1, s2, n2;
+        fifo.prepareToWrite (1, s1, n1, s2, n2);
+        if (n1 == 0) return false;
+        buf[s1] = e;
+        fifo.finishedWrite (n1);
+        return true;
+    }
+
+    bool pop (MidiEvent& e)
+    {
+        int s1, n1, s2, n2;
+        fifo.prepareToRead (1, s1, n1, s2, n2);
+        if (n1 == 0) return false;
+        e = buf[s1];
+        fifo.finishedRead (n1);
+        return true;
+    }
+
+private:
+    juce::AbstractFifo                   fifo { kCapacity };
+    std::array<MidiEvent, kCapacity>     buf;
+};
+
+//==============================================================================
+// MidiInputHandler — JUCE callback, runs on the OS MIDI thread
+//==============================================================================
+class MidiInputHandler : public juce::MidiInputCallback
+{
+public:
+    explicit MidiInputHandler (MidiEventQueue& q) : queue (q) {}
+
+    void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& msg) override
+    {
+        MidiEvent e;
+        const uint8_t* raw = msg.getRawData();
+        e.size = std::min ((int) msg.getRawDataSize(), 4);
+        for (int i = 0; i < e.size; ++i)
+            e.data[i] = raw[i];
+        e.receiveTimeSecs = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        queue.push (e);
+    }
+
+private:
+    MidiEventQueue& queue;
+};
+
+//==============================================================================
+struct TrakdawBehaviour : public te::EngineBehaviour
+{
+    bool autoInitialiseDeviceManager() override { return false; }
+};
+
+//==============================================================================
+static te::MonotonicBeat getLaunchPosition (te::Edit& edit)
+{
+    if (auto epc = edit.getTransport().getCurrentPlaybackContext())
+        if (auto syncPoint = epc->getSyncPoint())
+            return syncPoint->monotonicBeat;
+    return {};
+}
+
+//==============================================================================
+// Phase 5: Python arrangement layer
+//==============================================================================
+
+// Global context — set before the Python interpreter starts, read-only thereafter.
+static te::Edit* g_pyEdit = nullptr;
+
+// ---------------------------------------------------------------------------
+// Proxy: a timeline MIDI clip owned by the Edit
+// ---------------------------------------------------------------------------
+struct PyMidiClip
+{
+    te::MidiClip* ptr = nullptr;   // raw pointer — valid for Edit lifetime
+
+    void addNote (int pitch, double startBeat, double lenBeats,
+                  int velocity = 100, int channel = 1)
+    {
+        if (!ptr) return;
+        struct Args { PyMidiClip* self; int pitch; double sb, lb; int vel, ch; };
+        Args args { this, pitch, startBeat, lenBeats, velocity, channel };
+        py::gil_scoped_release release;
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [] (void* ctx) -> void*
+            {
+                auto* a  = static_cast<Args*>(ctx);
+                auto* um = &g_pyEdit->getUndoManager();
+                a->self->ptr->getSequence().addNote (
+                    a->pitch,
+                    te::BeatPosition::fromBeats (a->sb),
+                    te::BeatDuration::fromBeats (a->lb),
+                    a->vel, a->ch - 1, um);
+                return nullptr;
+            }, &args);
+    }
+
+    void clear()
+    {
+        if (!ptr) return;
+        py::gil_scoped_release release;
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [] (void* ctx) -> void*
+            {
+                auto* self = static_cast<PyMidiClip*>(ctx);
+                self->ptr->getSequence().clear (&g_pyEdit->getUndoManager());
+                return nullptr;
+            }, this);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Proxy: an audio track in the Edit
+// ---------------------------------------------------------------------------
+struct PyTrack
+{
+    int index = -1;   // 0-based
+
+    std::string name() const
+    {
+        auto tr = te::getAudioTracks (*g_pyEdit);
+        if (index < 0 || index >= tr.size()) return {};
+        return tr[index]->getName().toStdString();
+    }
+
+    PyMidiClip newMidiClip (int startBar, int lengthBars)
+    {
+        PyMidiClip result;
+        py::gil_scoped_release release;
+
+        struct Args { int idx, sb, lb; PyMidiClip* out; };
+        Args args { index, startBar, lengthBars, &result };
+
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [] (void* ctx) -> void*
+            {
+                auto* a  = static_cast<Args*>(ctx);
+                auto  tr = te::getAudioTracks (*g_pyEdit);
+                if (a->idx < 0 || a->idx >= tr.size()) return nullptr;
+                auto* at = tr[a->idx];
+                auto* um = &g_pyEdit->getUndoManager();
+
+                double startBeat = (a->sb - 1) * 4.0;
+                double endBeat   = startBeat + a->lb * 4.0;
+                auto   startTime = g_pyEdit->tempoSequence.toTime (
+                                       te::BeatPosition::fromBeats (startBeat));
+                auto   endTime   = g_pyEdit->tempoSequence.toTime (
+                                       te::BeatPosition::fromBeats (endBeat));
+
+                // insertMIDIClip takes a SelectionManager*, not UndoManager*
+                auto clipPtr = at->insertMIDIClip (te::TimeRange (startTime, endTime), nullptr);
+                a->out->ptr = clipPtr.get();
+                return nullptr;
+            }, &args);
+
+        return result;
+    }
+
+    void clearClips()
+    {
+        py::gil_scoped_release release;
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [] (void* ctx) -> void*
+            {
+                auto* a  = static_cast<PyTrack*>(ctx);
+                auto  tr = te::getAudioTracks (*g_pyEdit);
+                if (a->index < 0 || a->index >= tr.size()) return nullptr;
+                for (auto* clip : tr[a->index]->getClips())
+                    clip->removeFromParent();
+                return nullptr;
+            }, this);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The embedded `daw` Python module
+// Registered at static-init time; interpreter must start after g_pyEdit is set.
+// ---------------------------------------------------------------------------
+PYBIND11_EMBEDDED_MODULE (daw, m)
+{
+    m.doc() = "trakdaw Python arrangement API";
+
+    // --- transport (fire-and-forget; Python doesn't need to block) ---
+    m.def ("play",  [] { juce::MessageManager::callAsync ([] { g_pyEdit->getTransport().play (false); }); });
+    m.def ("stop",  [] { juce::MessageManager::callAsync ([] { g_pyEdit->getTransport().stop (false, false); }); });
+    m.def ("bpm",   [] -> double { return g_pyEdit->tempoSequence.getTempo (0)->getBpm(); });
+    m.def ("set_bpm", [] (double bpm) {
+        juce::MessageManager::callAsync ([bpm] { g_pyEdit->tempoSequence.getTempo (0)->setBpm (bpm); });
+    });
+    m.def ("position", [] -> double {
+        return g_pyEdit->getTransport().getPosition().inSeconds();
+    });
+    m.def ("playing", [] -> bool { return g_pyEdit->getTransport().isPlaying(); });
+
+    // --- track proxy ---
+    py::class_<PyTrack> (m, "Track")
+        .def_property_readonly ("name",    &PyTrack::name)
+        .def ("new_midi_clip", &PyTrack::newMidiClip,
+              py::arg ("start_bar") = 1, py::arg ("length_bars") = 4,
+              "Create a new timeline MIDI clip (bars are 1-based, 4/4 assumed)")
+        .def ("clear_clips", &PyTrack::clearClips,
+              "Remove all timeline clips from this track");
+
+    // --- midi clip proxy ---
+    py::class_<PyMidiClip> (m, "MidiClip")
+        .def ("add_note", &PyMidiClip::addNote,
+              py::arg ("pitch"), py::arg ("start_beat"),
+              py::arg ("length") = 1.0, py::arg ("velocity") = 100,
+              py::arg ("channel") = 1,
+              "Add a MIDI note (beats are 0-based within the clip)")
+        .def ("clear", &PyMidiClip::clear, "Remove all notes from this clip");
+
+    // --- edit access ---
+    m.def ("tracks", [] {
+        std::vector<PyTrack> result;
+        auto tr = te::getAudioTracks (*g_pyEdit);
+        for (int i = 0; i < (int) tr.size(); ++i)
+            result.push_back ({ i });
+        return result;
+    }, "Return list of all audio tracks");
+
+    m.def ("track", [] (py::object nameOrIdx) -> PyTrack {
+        auto tr = te::getAudioTracks (*g_pyEdit);
+        if (py::isinstance<py::int_> (nameOrIdx))
+        {
+            int idx = nameOrIdx.cast<int>() - 1;   // 1-based → 0-based
+            if (idx >= 0 && idx < (int) tr.size()) return { idx };
+        }
+        else if (py::isinstance<py::str> (nameOrIdx))
+        {
+            auto name = nameOrIdx.cast<std::string>();
+            for (int i = 0; i < (int) tr.size(); ++i)
+                if (tr[i]->getName().toStdString() == name)
+                    return { i };
+        }
+        throw py::index_error ("track not found: " + py::str (nameOrIdx).cast<std::string>());
+    }, py::arg ("name_or_index"),
+       "Get a track by 1-based index or name");
+}
+
+// ---------------------------------------------------------------------------
+// PythonHost — owns the CPython interpreter, runs scripts serially
+// ---------------------------------------------------------------------------
+class PythonHost : private juce::Thread
+{
+public:
+    PythonHost() : juce::Thread ("python-host") {}
+
+    void start()    { startThread(); }
+    void shutdown() { signalThreadShouldExit(); event.signal(); stopThread (5000); }
+
+    // Thread-safe: enqueue a script path for execution
+    void runScript (const std::string& path)
+    {
+        {
+            std::lock_guard<std::mutex> lock (mtx);
+            scriptQueue.push (path);
+        }
+        event.signal();
+    }
+
+private:
+    void run() override
+    {
+        py::initialize_interpreter();
+
+        // Force line-buffered stdout/stderr so print() appears immediately
+        py::exec (R"(
+import sys, io
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, line_buffering=True)
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, line_buffering=True)
+)");
+
+        while (!threadShouldExit())
+        {
+            event.wait (500);
+
+            std::string path;
+            {
+                std::lock_guard<std::mutex> lock (mtx);
+                if (!scriptQueue.empty())
+                {
+                    path = scriptQueue.front();
+                    scriptQueue.pop();
+                }
+            }
+
+            if (path.empty()) continue;
+
+            std::cout << "[python] running: " << path << "\n";
+            try
+            {
+                py::eval_file (path);
+                py::exec ("import sys; sys.stdout.flush(); sys.stderr.flush()");
+                std::cout << "[python] done: " << path << "\n> " << std::flush;
+            }
+            catch (py::error_already_set& e)
+            {
+                std::cerr << "[python error] " << e.what() << "\n> " << std::flush;
+            }
+        }
+
+        py::finalize_interpreter();
+    }
+
+    std::mutex              mtx;
+    std::queue<std::string> scriptQueue;
+    juce::WaitableEvent     event { false };
+};
+
+//==============================================================================
+// Decode a MidiEvent and call on_midi(msg) if defined. Lua-thread only.
+//==============================================================================
+static void dispatchMidiToLua (sol::state& lua, const MidiEvent& e)
+{
+    sol::object cb = lua["on_midi"];
+    if (cb.get_type() != sol::type::function) return;
+
+    const uint8_t status  = e.data[0] & 0xF0;
+    const uint8_t channel = (e.data[0] & 0x0F) + 1;
+
+    double dispatchTime = juce::Time::getMillisecondCounterHiRes() * 0.001;
+
+    sol::table msg = lua.create_table();
+    msg["channel"]       = (int) channel;
+    msg["receive_time"]  = e.receiveTimeSecs;
+    msg["dispatch_time"] = dispatchTime;
+    msg["latency_ms"]    = (dispatchTime - e.receiveTimeSecs) * 1000.0;
+
+    if (status == 0x90 && e.size >= 3 && e.data[2] > 0)
+    {
+        msg["type"]     = "note_on";
+        msg["note"]     = (int) e.data[1];
+        msg["velocity"] = (int) e.data[2];
+    }
+    else if (status == 0x80 || (status == 0x90 && e.size >= 3 && e.data[2] == 0))
+    {
+        msg["type"]     = "note_off";
+        msg["note"]     = (int) e.data[1];
+        msg["velocity"] = (int) e.data[2];
+    }
+    else if (status == 0xB0 && e.size >= 3)
+    {
+        msg["type"]  = "cc";
+        msg["cc"]    = (int) e.data[1];
+        msg["value"] = (int) e.data[2];
+    }
+    else if (status == 0xE0 && e.size >= 3)
+    {
+        msg["type"]  = "pitchbend";
+        msg["value"] = (int) ((e.data[1] & 0x7F) | ((e.data[2] & 0x7F) << 7)) - 8192;
+    }
+    else
+    {
+        msg["type"]   = "other";
+        msg["status"] = (int) e.data[0];
+    }
+
+    auto result = cb.as<sol::protected_function>()(msg);
+    if (!result.valid())
+    {
+        sol::error err = result;
+        std::cerr << "\n[on_midi error] " << err.what() << "\n> " << std::flush;
+    }
+}
+
+//==============================================================================
+// Register the `daw` table.
+// onWatch(path) is called when load_script succeeds — lets LuaRepl set up watching.
+//==============================================================================
+static void registerDawApi (sol::state& lua,
+                             te::Edit& edit,
+                             MidiEventQueue& midiQueue,
+                             std::function<void(const std::string&)> onWatch,
+                             PythonHost& pythonHost)
+{
+    auto daw = lua.create_named_table ("daw");
+
+    // --- transport ---
+
+    daw.set_function ("play", [&edit]() {
+        juce::MessageManager::callAsync ([&edit] { edit.getTransport().play (false); });
+    });
+
+    daw.set_function ("stop", [&edit]() {
+        juce::MessageManager::callAsync ([&edit] { edit.getTransport().stop (false, false); });
+    });
+
+    daw.set_function ("position", [&edit]() -> double {
+        return edit.getTransport().getPosition().inSeconds();
+    });
+
+    daw.set_function ("playing", [&edit]() -> bool {
+        return edit.getTransport().isPlaying();
+    });
+
+    daw.set_function ("bpm", [&edit]() -> double {
+        return edit.tempoSequence.getTempo (0)->getBpm();
+    });
+
+    daw.set_function ("set_bpm", [&edit](double bpm) {
+        juce::MessageManager::callAsync ([&edit, bpm] {
+            edit.tempoSequence.getTempo (0)->setBpm (bpm);
+        });
+    });
+
+    // --- clips ---
+
+    daw.set_function ("clip", [&edit](sol::this_state ts, int trackIdx, int slotIdx) -> sol::object {
+        auto tracks = te::getAudioTracks (edit);
+        if (trackIdx < 1 || trackIdx > tracks.size()) return sol::lua_nil;
+        auto* at    = tracks[trackIdx - 1];
+        auto  slots = at->getClipSlotList().getClipSlots();
+        if (slotIdx < 1 || slotIdx > slots.size()) return sol::lua_nil;
+        auto* clip  = slots[slotIdx - 1]->getClip();
+        if (!clip) return sol::lua_nil;
+
+        sol::state_view lv (ts);
+        sol::table t = lv.create_table();
+        t["name"] = clip->getName().toStdString();
+
+        t["launch"] = [&edit, trackIdx, slotIdx]() {
+            juce::MessageManager::callAsync ([&edit, trackIdx, slotIdx] {
+                auto tr = te::getAudioTracks (edit);
+                if (trackIdx < 1 || trackIdx > tr.size()) return;
+                auto sl = tr[trackIdx - 1]->getClipSlotList().getClipSlots();
+                if (slotIdx < 1 || slotIdx > sl.size()) return;
+                if (auto* c = sl[slotIdx - 1]->getClip())
+                    if (auto lh = c->getLaunchHandle())
+                        lh->play (getLaunchPosition (edit));
+            });
+        };
+
+        t["stop"] = [&edit, trackIdx, slotIdx]() {
+            juce::MessageManager::callAsync ([&edit, trackIdx, slotIdx] {
+                auto tr = te::getAudioTracks (edit);
+                if (trackIdx < 1 || trackIdx > tr.size()) return;
+                auto sl = tr[trackIdx - 1]->getClipSlotList().getClipSlots();
+                if (slotIdx < 1 || slotIdx > sl.size()) return;
+                if (auto* c = sl[slotIdx - 1]->getClip())
+                    if (auto lh = c->getLaunchHandle())
+                        lh->stop ({});
+            });
+        };
+
+        t["playing"] = [&edit, trackIdx, slotIdx]() -> bool {
+            auto tr = te::getAudioTracks (edit);
+            if (trackIdx < 1 || trackIdx > tr.size()) return false;
+            auto sl = tr[trackIdx - 1]->getClipSlotList().getClipSlots();
+            if (slotIdx < 1 || slotIdx > sl.size()) return false;
+            if (auto* c = sl[slotIdx - 1]->getClip())
+                if (auto lh = c->getLaunchHandle())
+                    return lh->getPlayingStatus() == te::LaunchHandle::PlayState::playing;
+            return false;
+        };
+
+        return t;
+    });
+
+    daw.set_function ("tracks", [&edit](sol::this_state ts) -> sol::table {
+        sol::state_view lv (ts);
+        sol::table t = lv.create_table();
+        int i = 1;
+        for (auto* at : te::getAudioTracks (edit))
+            t[i++] = at->getName().toStdString();
+        return t;
+    });
+
+    // --- MIDI ---
+
+    // daw.inject_midi(note, vel [, channel=1])
+    // Pushes a synthetic note-on into the MIDI queue.
+    // Dispatched on the next drainMidi() call (≤10ms).
+    daw.set_function ("inject_midi", [&midiQueue](int note, int vel, sol::optional<int> ch) {
+        MidiEvent e;
+        e.data[0]         = uint8_t (0x90 | ((ch.value_or (1) - 1) & 0x0F));
+        e.data[1]         = uint8_t (note & 0x7F);
+        e.data[2]         = uint8_t (vel  & 0x7F);
+        e.size            = 3;
+        e.receiveTimeSecs = juce::Time::getMillisecondCounterHiRes() * 0.001;
+        midiQueue.push (e);
+    });
+
+    // --- scripting ---
+
+    // daw.load_script(path) — execute a Lua file and start watching it for changes
+    daw.set_function ("load_script", [&lua, onWatch](const std::string& path) -> bool {
+        auto result = lua.safe_script_file (path, sol::script_pass_on_error);
+        if (!result.valid())
+        {
+            sol::error err = result;
+            std::cerr << "[load_script error] " << err.what() << "\n";
+            return false;
+        }
+        onWatch (path);
+        return true;
+    });
+
+    // --- persistent store ---
+
+    // daw.store persists across hot reloads (the Lua state is not replaced).
+    // Scripts should treat it as a simple key-value bag of primitives.
+    // Pattern: daw.store.counter = (daw.store.counter or 0) + 1
+    sol::object existing = daw["store"];
+    if (existing.get_type() != sol::type::table)
+        daw["store"] = lua.create_table();
+
+    // --- Python bridge ---
+
+    // daw.run_python("path.py")  — execute a Python arrangement script
+    daw.set_function ("run_python", [&pythonHost](const std::string& path) {
+        pythonHost.runScript (path);
+    });
+}
+
+//==============================================================================
+// LuaRepl
+//==============================================================================
+class LuaRepl : private juce::Thread
+{
+public:
+    LuaRepl (te::Edit& edit, MidiEventQueue& midiQueue, PythonHost& pythonHost)
+        : juce::Thread ("lua-repl"), edit (edit), midiQueue (midiQueue)
+    {
+        lua.open_libraries (sol::lib::base, sol::lib::string,
+                            sol::lib::table,  sol::lib::math,
+                            sol::lib::io,     sol::lib::os);
+
+        registerDawApi (lua, edit, midiQueue,
+            [this](const std::string& path) {
+                watch.path  = path;
+                watch.mtime = juce::File (path).getLastModificationTime();
+                watch.pending = false;
+                std::cout << "[watch] monitoring: "
+                          << juce::File (path).getFileName() << "\n> " << std::flush;
+            },
+            pythonHost);
+    }
+
+    void start()    { startThread(); }
+    void shutdown() { signalThreadShouldExit(); stopThread (2000); }
+
+private:
+    // -----------------------------------------------------------------------
+    // Evaluate one line (expression first, then statement)
+    // -----------------------------------------------------------------------
+    void evalLine (const std::string& line)
+    {
+        auto result = lua.safe_script ("return " + line, sol::script_pass_on_error);
+        if (!result.valid())
+            result = lua.safe_script (line, sol::script_pass_on_error);
+
+        if (!result.valid())
+        {
+            sol::error err = result;
+            std::cout << "error: " << err.what() << "\n";
+            return;
+        }
+
+        for (int i = 0; i < (int) result.return_count(); ++i)
+            printValue (result[i]);
+    }
+
+    static void printValue (sol::object obj)
+    {
+        switch (obj.get_type())
+        {
+            case sol::type::nil:     break;
+            case sol::type::boolean: std::cout << (obj.as<bool>() ? "true" : "false") << "\n"; break;
+            case sol::type::number:  std::cout << obj.as<double>()      << "\n"; break;
+            case sol::type::string:  std::cout << obj.as<std::string>() << "\n"; break;
+            case sol::type::table:
+            {
+                sol::table t = obj.as<sol::table>();
+                std::cout << "{\n";
+                t.for_each ([](sol::object k, sol::object v) {
+                    std::cout << "  [";
+                    if (k.get_type() == sol::type::string) std::cout << k.as<std::string>();
+                    else                                   std::cout << k.as<double>();
+                    std::cout << "] = ";
+                    if      (v.get_type() == sol::type::string)  std::cout << v.as<std::string>();
+                    else if (v.get_type() == sol::type::number)  std::cout << v.as<double>();
+                    else if (v.get_type() == sol::type::boolean) std::cout << (v.as<bool>() ? "true" : "false");
+                    else                                         std::cout << "(function/table)";
+                    std::cout << "\n";
+                });
+                std::cout << "}\n";
+                break;
+            }
+            default: std::cout << "(value)\n"; break;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MIDI dispatch
+    // -----------------------------------------------------------------------
+    void drainMidi()
+    {
+        MidiEvent e;
+        while (midiQueue.pop (e))
+            dispatchMidiToLua (lua, e);
+    }
+
+    // -----------------------------------------------------------------------
+    // Hot reload
+    // -----------------------------------------------------------------------
+
+    // True if we are at or within 20ms of a 4/4 bar boundary, or if stopped.
+    bool isAtBarBoundary() const
+    {
+        if (!edit.getTransport().isPlaying()) return true;
+
+        const double secs      = edit.getTransport().getPosition().inSeconds();
+        const double bpm       = edit.tempoSequence.getTempo (0)->getBpm();
+        const double beat      = secs * bpm / 60.0;
+        const double barPos    = std::fmod (beat, 4.0);    // position within bar [0,4)
+        const double threshold = 0.020 * (bpm / 60.0);    // 20ms in beats
+
+        return barPos < threshold || barPos > 4.0 - threshold;
+    }
+
+    // Check file mtime every 500ms (every 50 × 10ms poll cycles).
+    void checkFileForChanges()
+    {
+        if (watch.path.empty()) return;
+        if (++watch.pollCount % 50 != 0) return;
+
+        auto newMtime = juce::File (watch.path).getLastModificationTime();
+        if (newMtime != watch.mtime)
+        {
+            watch.mtime   = newMtime;
+            watch.pending = true;
+            std::cout << "\n[hot-reload] change detected — waiting for bar boundary...\n> "
+                      << std::flush;
+        }
+    }
+
+    // Fire the reload when the timing is right.
+    void reloadIfReady()
+    {
+        if (!watch.pending)        return;
+        if (!isAtBarBoundary())    return;
+
+        watch.pending = false;
+
+        auto result = lua.safe_script_file (watch.path, sol::script_pass_on_error);
+        if (result.valid())
+        {
+            std::cout << "[hot-reload] reloaded: "
+                      << juce::File (watch.path).getFileName() << "\n> " << std::flush;
+        }
+        else
+        {
+            sol::error err = result;
+            std::cout << "[hot-reload] error: " << err.what() << "\n> " << std::flush;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // REPL loop
+    // -----------------------------------------------------------------------
+    void run() override
+    {
+        std::cout << "\ntrakdaw Lua REPL (Phase 4 — hot reload)\n";
+        std::cout << "  daw.play() / daw.stop()              transport\n";
+        std::cout << "  daw.clip(t,s).launch()               launch clip (1-based)\n";
+        std::cout << "  daw.inject_midi(note, vel)           fake MIDI note-on\n";
+        std::cout << "  daw.load_script(\"path.lua\")          load + watch for changes\n";
+        std::cout << "  daw.store.x = val                    persistent across reloads\n";
+        std::cout << "  function on_midi(m) ... end          MIDI callback\n";
+        std::cout << "  quit / exit\n\n";
+
+        std::cout << "> " << std::flush;
+
+        std::string line;
+
+        while (!threadShouldExit())
+        {
+            fd_set fds;
+            FD_ZERO (&fds);
+            FD_SET (STDIN_FILENO, &fds);
+            struct timeval tv { 0, 10'000 };   // 10ms
+
+            int ready = ::select (STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
+
+            if (ready > 0)
+            {
+                if (!std::getline (std::cin, line))
+                    break;
+
+                if (line == "quit" || line == "exit")
+                {
+                    juce::MessageManager::callAsync ([] {
+                        juce::JUCEApplicationBase::getInstance()->quit();
+                    });
+                    break;
+                }
+
+                if (!line.empty())
+                    evalLine (line);
+
+                std::cout << "> " << std::flush;
+            }
+
+            drainMidi();
+            checkFileForChanges();
+            reloadIfReady();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    struct WatchState
+    {
+        std::string path;
+        juce::Time  mtime;
+        bool        pending   = false;
+        int         pollCount = 0;
+    };
+
+    te::Edit&       edit;
+    MidiEventQueue& midiQueue;
+    sol::state      lua;
+    WatchState      watch;
+};
+
+//==============================================================================
+class TrakdawApp : public juce::JUCEApplicationBase
+{
+public:
+    const juce::String getApplicationName()    override { return "trakdaw"; }
+    const juce::String getApplicationVersion() override { return "0.1.0"; }
+    bool moreThanOneInstanceAllowed()          override { return true; }
+
+    void initialise (const juce::String&) override
+    {
+        // 1. Engine
+        std::cout << "[trakdaw] Creating engine...\n";
+        engine = std::make_unique<te::Engine> ("trakdaw",
+                                               std::make_unique<te::UIBehaviour>(),
+                                               std::make_unique<TrakdawBehaviour>());
+        // 2. Devices
+        auto& dm = engine->getDeviceManager();
+        dm.initialise (0, 2);
+        std::cout << "[trakdaw] Device manager initialised\n";
+
+        // 3. MIDI inputs
+        midiHandler = std::make_unique<MidiInputHandler> (midiQueue);
+        for (auto& info : juce::MidiInput::getAvailableDevices())
+        {
+            auto mi = juce::MidiInput::openDevice (info.identifier, midiHandler.get());
+            if (mi)
+            {
+                mi->start();
+                std::cout << "[trakdaw] MIDI in: " << info.name << "\n";
+                midiInputs.push_back (std::move (mi));
+            }
+        }
+        if (midiInputs.empty())
+            std::cout << "[trakdaw] No MIDI input devices found\n";
+
+        // 4. Edit
+        editFile = juce::File::createTempFile (".tracktionedit");
+        edit = te::createEmptyEdit (*engine, editFile);
+        edit->tempoSequence.getTempo (0)->setBpm (120.0);
+        std::cout << "[trakdaw] Edit created @ "
+                  << edit->tempoSequence.getTempo (0)->getBpm() << " BPM\n";
+
+        // 5. Clip grid
+        edit->ensureNumberOfAudioTracks (2);
+        edit->getSceneList().ensureNumberOfScenes (2);
+        auto tracks = te::getAudioTracks (*edit);
+        for (auto* at : tracks)
+            at->getClipSlotList().ensureNumberOfSlots (2);
+
+        auto* um = &edit->getUndoManager();
+
+        {
+            auto* at = tracks[0];
+            at->setName ("Bass");
+            auto mc = te::insertMIDIClip (
+                *at->getClipSlotList().getClipSlots()[0],
+                edit->tempoSequence.toTime ({ 0_bp, 16_bp }));
+            mc->setName ("Bass A");
+            auto& seq = mc->getSequence();
+            seq.addNote (36, 0_bp,  4_bd, 100, 0, um);
+            seq.addNote (36, 4_bp,  4_bd, 80,  0, um);
+            seq.addNote (43, 8_bp,  4_bd, 90,  0, um);
+            seq.addNote (41, 12_bp, 4_bd, 85,  0, um);
+        }
+        {
+            auto* at = tracks[1];
+            at->setName ("Melody");
+            auto mc = te::insertMIDIClip (
+                *at->getClipSlotList().getClipSlots()[0],
+                edit->tempoSequence.toTime ({ 0_bp, 8_bp }));
+            mc->setName ("Melody A");
+            auto& seq = mc->getSequence();
+            seq.addNote (60, 0_bp, 2_bd, 90, 0, um);
+            seq.addNote (62, 2_bp, 2_bd, 85, 0, um);
+            seq.addNote (64, 4_bp, 2_bd, 90, 0, um);
+            seq.addNote (67, 6_bp, 2_bd, 80, 0, um);
+        }
+
+        std::cout << "[trakdaw] Clip grid ready:\n";
+        for (auto* at : te::getAudioTracks (*edit))
+        {
+            std::cout << "  [" << at->getName() << "]\n";
+            for (auto* slot : at->getClipSlotList().getClipSlots())
+            {
+                if (auto* clip = slot->getClip())
+                    std::cout << "    " << clip->getName() << "\n";
+                else
+                    std::cout << "    (empty)\n";
+            }
+        }
+
+        // 6. Python host — set global context then start interpreter thread
+        g_pyEdit = edit.get();
+        pythonHost = std::make_unique<PythonHost>();
+        pythonHost->start();
+        std::cout << "[trakdaw] Python host started\n";
+
+        // 7. Lua REPL
+        repl = std::make_unique<LuaRepl> (*edit, midiQueue, *pythonHost);
+        repl->start();
+    }
+
+    void shutdown() override
+    {
+        if (repl)        { repl->shutdown();        repl.reset(); }
+        if (pythonHost)  { pythonHost->shutdown();  pythonHost.reset(); }
+        g_pyEdit = nullptr;
+
+        for (auto& mi : midiInputs) mi->stop();
+        midiInputs.clear();
+        midiHandler.reset();
+
+        if (edit) { edit->getTransport().stop (false, false); edit.reset(); }
+        if (engine)
+        {
+            engine->getTemporaryFileManager().getTempDirectory().deleteRecursively();
+            engine.reset();
+        }
+    }
+
+    void systemRequestedQuit()                         override { quit(); }
+    void anotherInstanceStarted (const juce::String&)  override {}
+    void suspended()                                   override {}
+    void resumed()                                     override {}
+    void unhandledException (const std::exception*,
+                             const juce::String&, int) override {}
+
+private:
+    std::unique_ptr<te::Engine>                   engine;
+    std::unique_ptr<te::Edit>                     edit;
+    juce::File                                    editFile;
+    MidiEventQueue                                midiQueue;
+    std::unique_ptr<MidiInputHandler>             midiHandler;
+    std::vector<std::unique_ptr<juce::MidiInput>> midiInputs;
+    std::unique_ptr<PythonHost>                   pythonHost;
+    std::unique_ptr<LuaRepl>                      repl;
+};
+
+//==============================================================================
+START_JUCE_APPLICATION (TrakdawApp)
