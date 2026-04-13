@@ -22,6 +22,7 @@ namespace py = pybind11;
 #include <sys/select.h>
 #include <unistd.h>
 #include <cmath>
+#include <map>
 #include <mutex>
 #include <queue>
 
@@ -564,6 +565,48 @@ static void registerDawApi (sol::state& lua,
     daw.set_function ("run_python", [&pythonHost](const std::string& path) {
         pythonHost.runScript (path);
     });
+
+    // --- follow actions ---
+
+    // daw._follow  — internal table: "t:s" → callback function
+    // Persists across hot reloads (same as daw.store).
+    {
+        sol::object existing = daw["_follow"];
+        if (existing.get_type() != sol::type::table)
+            daw["_follow"] = lua.create_table();
+    }
+
+    // daw.on_end(track, slot, fn)
+    // Register fn to be called when clip at (track, slot) finishes playing.
+    // fn receives: { track, slot, name }
+    // Set fn = nil to deregister.
+    daw.set_function ("on_end", [](sol::this_state ts, int t, int s, sol::object fn) {
+        sol::state_view lv (ts);
+        sol::table follow = lv["daw"]["_follow"];
+        follow[std::to_string (t) + ":" + std::to_string (s)] = fn;
+    });
+
+    // daw.trigger_follow(track, slot)
+    // Manually fire the on_end callback for a slot. Useful for testing without
+    // a running audio engine (no real clip playback required).
+    daw.set_function ("trigger_follow", [](sol::this_state ts, int t, int s) {
+        sol::state_view lv (ts);
+        sol::table follow = lv["daw"]["_follow"];
+        sol::object fn = follow[std::to_string (t) + ":" + std::to_string (s)];
+        if (fn.get_type() != sol::type::function) return;
+
+        sol::table info = lv.create_table();
+        info["track"] = t;
+        info["slot"]  = s;
+        info["name"]  = "(manually triggered)";
+
+        auto result = fn.as<sol::protected_function>() (info);
+        if (!result.valid())
+        {
+            sol::error err = result;
+            std::cerr << "\n[trigger_follow error] " << err.what() << "\n> " << std::flush;
+        }
+    });
 }
 
 //==============================================================================
@@ -758,7 +801,76 @@ private:
             drainMidi();
             checkFileForChanges();
             reloadIfReady();
+            checkFollowActions();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Follow action state per tracked clip slot
+    // -----------------------------------------------------------------------
+    struct FollowState
+    {
+        te::LaunchHandle::PlayState prevState = te::LaunchHandle::PlayState::stopped;
+        bool everPlayed = false;
+    };
+
+    // Check all slots that have registered on_end callbacks.
+    // Called every poll cycle (~10ms). Fires callback on playing→stopped transition.
+    void checkFollowActions()
+    {
+        sol::object followObj = lua["daw"]["_follow"];
+        if (followObj.get_type() != sol::type::table) return;
+        sol::table follow = followObj.as<sol::table>();
+
+        auto tracks = te::getAudioTracks (edit);
+
+        follow.for_each ([&](sol::object key, sol::object val)
+        {
+            if (key.get_type() != sol::type::string) return;
+            if (val.get_type() != sol::type::function) return;
+
+            const std::string keyStr = key.as<std::string>();
+            const auto colon = keyStr.find (':');
+            if (colon == std::string::npos) return;
+            int t = std::stoi (keyStr.substr (0, colon));
+            int s = std::stoi (keyStr.substr (colon + 1));
+
+            if (t < 1 || t > tracks.size()) return;
+            auto slots = tracks[t - 1]->getClipSlotList().getClipSlots();
+            if (s < 1 || s > slots.size()) return;
+            auto* clip = slots[s - 1]->getClip();
+            if (!clip) return;
+            auto lh = clip->getLaunchHandle();
+            if (!lh) return;
+
+            auto& st  = followStates[{ t, s }];
+            auto  cur = lh->getPlayingStatus();
+
+            if (cur == te::LaunchHandle::PlayState::playing)
+                st.everPlayed = true;
+
+            if (st.everPlayed
+                && st.prevState == te::LaunchHandle::PlayState::playing
+                && cur          == te::LaunchHandle::PlayState::stopped)
+            {
+                // Clip just finished naturally — fire the callback
+                st.everPlayed = false;
+
+                sol::table info = lua.create_table();
+                info["track"] = t;
+                info["slot"]  = s;
+                info["name"]  = clip->getName().toStdString();
+
+                auto result = val.as<sol::protected_function>() (info);
+                if (!result.valid())
+                {
+                    sol::error err = result;
+                    std::cerr << "\n[on_end error] " << err.what() << "\n> " << std::flush;
+                }
+            }
+
+            st.prevState = cur;
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -774,6 +886,7 @@ private:
     MidiEventQueue& midiQueue;
     sol::state      lua;
     WatchState      watch;
+    std::map<std::pair<int,int>, FollowState> followStates;
 };
 
 //==============================================================================
@@ -852,6 +965,34 @@ public:
             seq.addNote (62, 2_bp, 2_bd, 85, 0, um);
             seq.addNote (64, 4_bp, 2_bd, 90, 0, um);
             seq.addNote (67, 6_bp, 2_bd, 80, 0, um);
+        }
+
+        // Slot 2: alternate variations (Bass B, Melody B)
+        {
+            // Bass B — root + fifth walk, shifted up a whole tone (D)
+            auto* at = tracks[0];
+            auto mc = te::insertMIDIClip (
+                *at->getClipSlotList().getClipSlots()[1],
+                edit->tempoSequence.toTime ({ 0_bp, 16_bp }));
+            mc->setName ("Bass B");
+            auto& seq = mc->getSequence();
+            seq.addNote (38, 0_bp,  4_bd, 100, 0, um);   // D2
+            seq.addNote (38, 4_bp,  4_bd, 80,  0, um);
+            seq.addNote (45, 8_bp,  4_bd, 90,  0, um);   // A2
+            seq.addNote (43, 12_bp, 4_bd, 85,  0, um);   // G2
+        }
+        {
+            // Melody B — minor pentatonic phrase (A minor)
+            auto* at = tracks[1];
+            auto mc = te::insertMIDIClip (
+                *at->getClipSlotList().getClipSlots()[1],
+                edit->tempoSequence.toTime ({ 0_bp, 8_bp }));
+            mc->setName ("Melody B");
+            auto& seq = mc->getSequence();
+            seq.addNote (69, 0_bp, 2_bd, 90, 0, um);  // A4
+            seq.addNote (67, 2_bp, 2_bd, 85, 0, um);  // G4
+            seq.addNote (65, 4_bp, 2_bd, 85, 0, um);  // F4
+            seq.addNote (62, 6_bp, 2_bd, 80, 0, um);  // D4
         }
 
         std::cout << "[trakdaw] Clip grid ready:\n";
