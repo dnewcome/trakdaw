@@ -375,62 +375,6 @@ if hasattr(sys.stderr, 'buffer'):
 };
 
 //==============================================================================
-// Decode a MidiEvent and call on_midi(msg) if defined. Lua-thread only.
-//==============================================================================
-static void dispatchMidiToLua (sol::state& lua, const MidiEvent& e)
-{
-    sol::object cb = lua["on_midi"];
-    if (cb.get_type() != sol::type::function) return;
-
-    const uint8_t status  = e.data[0] & 0xF0;
-    const uint8_t channel = (e.data[0] & 0x0F) + 1;
-
-    double dispatchTime = juce::Time::getMillisecondCounterHiRes() * 0.001;
-
-    sol::table msg = lua.create_table();
-    msg["channel"]       = (int) channel;
-    msg["receive_time"]  = e.receiveTimeSecs;
-    msg["dispatch_time"] = dispatchTime;
-    msg["latency_ms"]    = (dispatchTime - e.receiveTimeSecs) * 1000.0;
-
-    if (status == 0x90 && e.size >= 3 && e.data[2] > 0)
-    {
-        msg["type"]     = "note_on";
-        msg["note"]     = (int) e.data[1];
-        msg["velocity"] = (int) e.data[2];
-    }
-    else if (status == 0x80 || (status == 0x90 && e.size >= 3 && e.data[2] == 0))
-    {
-        msg["type"]     = "note_off";
-        msg["note"]     = (int) e.data[1];
-        msg["velocity"] = (int) e.data[2];
-    }
-    else if (status == 0xB0 && e.size >= 3)
-    {
-        msg["type"]  = "cc";
-        msg["cc"]    = (int) e.data[1];
-        msg["value"] = (int) e.data[2];
-    }
-    else if (status == 0xE0 && e.size >= 3)
-    {
-        msg["type"]  = "pitchbend";
-        msg["value"] = (int) ((e.data[1] & 0x7F) | ((e.data[2] & 0x7F) << 7)) - 8192;
-    }
-    else
-    {
-        msg["type"]   = "other";
-        msg["status"] = (int) e.data[0];
-    }
-
-    auto result = cb.as<sol::protected_function>()(msg);
-    if (!result.valid())
-    {
-        sol::error err = result;
-        std::cerr << "\n[on_midi error] " << err.what() << "\n> " << std::flush;
-    }
-}
-
-//==============================================================================
 // EventBroker — fan-out of script-emitted events to SSE subscribers.
 // See PLAN.md ("Control surface design") for the design rationale:
 // scripts opt into broadcasting via daw.emit(name, table); external clients
@@ -488,10 +432,90 @@ public:
             }
     }
 
+    // Auto-emit: the engine itself publishes built-in events (transport,
+    // clip_launch, follow, script_load, midi_in). Scripts toggle with
+    // daw.auto_emit(bool) / daw.auto_emit_midi_in(bool). midi_in is off by
+    // default because it can be very chatty.
+    std::atomic<bool> autoEmit{true};
+    std::atomic<bool> autoEmitMidiIn{false};
+
 private:
     std::mutex                              mu;
     std::vector<std::weak_ptr<Subscriber>>  subs;
 };
+
+// Helper: emit a built-in event if auto-emit is on.
+// dataJson should already be valid JSON (empty string = no data field).
+static inline void emitAuto (EventBroker& b, const char* name,
+                             const std::string& dataJson = {})
+{
+    if (! b.autoEmit.load()) return;
+    std::ostringstream o;
+    o << "{\"name\":\"" << name << "\"";
+    if (! dataJson.empty()) o << ",\"data\":" << dataJson;
+    o << "}";
+    b.emit (o.str());
+}
+
+//==============================================================================
+// Decode a MidiEvent and call on_midi(msg) if defined. Lua-thread only.
+// Also emits a "midi_in" event when broker.autoEmitMidiIn is set — useful
+// for watching MIDI traffic in the browser UI without writing a script.
+//==============================================================================
+static void dispatchMidiToLua (sol::state& lua, const MidiEvent& e,
+                               EventBroker& broker)
+{
+    const uint8_t status  = e.data[0] & 0xF0;
+    const uint8_t channel = (e.data[0] & 0x0F) + 1;
+
+    const char* type = "other";
+    int  note = -1, value = -1, cc = -1;
+    if (status == 0x90 && e.size >= 3 && e.data[2] > 0)
+        { type = "note_on";   note = e.data[1]; value = e.data[2]; }
+    else if (status == 0x80 || (status == 0x90 && e.size >= 3 && e.data[2] == 0))
+        { type = "note_off";  note = e.data[1]; value = e.data[2]; }
+    else if (status == 0xB0 && e.size >= 3)
+        { type = "cc";        cc   = e.data[1]; value = e.data[2]; }
+    else if (status == 0xE0 && e.size >= 3)
+        { type = "pitchbend"; value = (int) ((e.data[1] & 0x7F) | ((e.data[2] & 0x7F) << 7)) - 8192; }
+
+    if (broker.autoEmitMidiIn.load() && broker.autoEmit.load())
+    {
+        std::ostringstream o;
+        o << "{\"type\":\"" << type << "\",\"channel\":" << (int) channel;
+        if (note  >= 0) o << ",\"note\":" << note;
+        if (cc    >= 0) o << ",\"cc\":"   << cc;
+        if (value >= 0 || std::string(type) == "pitchbend")
+            o << ",\"value\":" << value;
+        o << "}";
+        broker.emit ("{\"name\":\"midi_in\",\"data\":" + o.str() + "}");
+    }
+
+    sol::object cb = lua["on_midi"];
+    if (cb.get_type() != sol::type::function) return;
+
+    double dispatchTime = juce::Time::getMillisecondCounterHiRes() * 0.001;
+
+    sol::table msg = lua.create_table();
+    msg["channel"]       = (int) channel;
+    msg["receive_time"]  = e.receiveTimeSecs;
+    msg["dispatch_time"] = dispatchTime;
+    msg["latency_ms"]    = (dispatchTime - e.receiveTimeSecs) * 1000.0;
+    msg["type"]          = type;
+    if (note  >= 0) msg["note"]     = note;
+    if (cc    >= 0) msg["cc"]       = cc;
+    if (value >= 0 || std::string(type) == "pitchbend") msg["value"] = value;
+    if (std::string(type) == "note_on" || std::string(type) == "note_off")
+        msg["velocity"] = value;
+    if (std::string(type) == "other") msg["status"] = (int) e.data[0];
+
+    auto result = cb.as<sol::protected_function>()(msg);
+    if (!result.valid())
+    {
+        sol::error err = result;
+        std::cerr << "\n[on_midi error] " << err.what() << "\n> " << std::flush;
+    }
+}
 
 //==============================================================================
 // Minimal Lua-to-JSON serializer. Only what daw.emit needs: nil/bool/number/
@@ -646,12 +670,24 @@ static void registerDawApi (sol::state& lua,
 
     // --- transport ---
 
-    daw.set_function ("play", [&edit]() {
-        juce::MessageManager::callAsync ([&edit] { edit.getTransport().play (false); });
+    daw.set_function ("play", [&edit, &eventBroker]() {
+        juce::MessageManager::callAsync ([&edit, &eventBroker] {
+            edit.getTransport().play (false);
+            std::ostringstream o;
+            o << "{\"playing\":true,\"position\":"
+              << edit.getTransport().getPosition().inSeconds() << "}";
+            emitAuto (eventBroker, "transport", o.str());
+        });
     });
 
-    daw.set_function ("stop", [&edit]() {
-        juce::MessageManager::callAsync ([&edit] { edit.getTransport().stop (false, false); });
+    daw.set_function ("stop", [&edit, &eventBroker]() {
+        juce::MessageManager::callAsync ([&edit, &eventBroker] {
+            edit.getTransport().stop (false, false);
+            std::ostringstream o;
+            o << "{\"playing\":false,\"position\":"
+              << edit.getTransport().getPosition().inSeconds() << "}";
+            emitAuto (eventBroker, "transport", o.str());
+        });
     });
 
     daw.set_function ("position", [&edit]() -> double {
@@ -835,7 +871,8 @@ static void registerDawApi (sol::state& lua,
 
     // --- clips ---
 
-    daw.set_function ("clip", [&edit](sol::this_state ts, int trackIdx, int slotIdx) -> sol::object {
+    daw.set_function ("clip",
+        [&edit, &eventBroker](sol::this_state ts, int trackIdx, int slotIdx) -> sol::object {
         auto tracks = te::getAudioTracks (edit);
         if (trackIdx < 1 || trackIdx > tracks.size()) return sol::lua_nil;
         auto* at    = tracks[trackIdx - 1];
@@ -848,8 +885,8 @@ static void registerDawApi (sol::state& lua,
         sol::table t = lv.create_table();
         t["name"] = clip->getName().toStdString();
 
-        t["launch"] = [&edit, trackIdx, slotIdx]() {
-            juce::MessageManager::callAsync ([&edit, trackIdx, slotIdx] {
+        t["launch"] = [&edit, &eventBroker, trackIdx, slotIdx]() {
+            juce::MessageManager::callAsync ([&edit, &eventBroker, trackIdx, slotIdx] {
                 auto tr = te::getAudioTracks (edit);
                 if (trackIdx < 1 || trackIdx > tr.size()) return;
                 auto sl = tr[trackIdx - 1]->getClipSlotList().getClipSlots();
@@ -857,28 +894,36 @@ static void registerDawApi (sol::state& lua,
                 if (auto* c = sl[slotIdx - 1]->getClip())
                     if (auto lh = c->getLaunchHandle())
                     {
-                        // Prefer the clip's own loop range; fall back to the
-                        // timeline length for freshly-inserted clips whose
-                        // loopLengthBeats defaults to 0.
                         auto loopBeats = c->getLoopLengthBeats();
                         if (loopBeats <= te::BeatDuration{})
                             loopBeats = c->getEndBeat() - c->getStartBeat();
                         if (loopBeats > te::BeatDuration{})
                             lh->setLooping (loopBeats);
                         lh->play (getLaunchPosition (edit));
+
+                        std::ostringstream o;
+                        o << "{\"track\":" << trackIdx
+                          << ",\"slot\":" << slotIdx
+                          << ",\"name\":\"" << c->getName().toStdString() << "\"}";
+                        emitAuto (eventBroker, "clip_launch", o.str());
                     }
             });
         };
 
-        t["stop"] = [&edit, trackIdx, slotIdx]() {
-            juce::MessageManager::callAsync ([&edit, trackIdx, slotIdx] {
+        t["stop"] = [&edit, &eventBroker, trackIdx, slotIdx]() {
+            juce::MessageManager::callAsync ([&edit, &eventBroker, trackIdx, slotIdx] {
                 auto tr = te::getAudioTracks (edit);
                 if (trackIdx < 1 || trackIdx > tr.size()) return;
                 auto sl = tr[trackIdx - 1]->getClipSlotList().getClipSlots();
                 if (slotIdx < 1 || slotIdx > sl.size()) return;
                 if (auto* c = sl[slotIdx - 1]->getClip())
                     if (auto lh = c->getLaunchHandle())
+                    {
                         lh->stop ({});
+                        std::ostringstream o;
+                        o << "{\"track\":" << trackIdx << ",\"slot\":" << slotIdx << "}";
+                        emitAuto (eventBroker, "clip_stop", o.str());
+                    }
             });
         };
 
@@ -1042,6 +1087,12 @@ static void registerDawApi (sol::state& lua,
             eventBroker.emit (out.str());
         });
 
+    // Master + per-topic toggles for engine-driven events.
+    daw.set_function ("auto_emit",
+        [&eventBroker](bool on) { eventBroker.autoEmit.store (on); });
+    daw.set_function ("auto_emit_midi_in",
+        [&eventBroker](bool on) { eventBroker.autoEmitMidiIn.store (on); });
+
     // --- native Tracktion MIDI input routing ---
     // Unlike the raw juce::MidiInput path (MidiEventQueue → on_midi), this
     // uses Tracktion's DeviceManager so MIDI flows straight into a track's
@@ -1155,20 +1206,24 @@ static void registerDawApi (sol::state& lua,
     // --- scripting ---
 
     // daw.load_script(path) — execute a Lua file and start watching it for changes
-    daw.set_function ("load_script", [&lua, onWatch](const std::string& path) -> bool {
-        // Resolve to absolute so juce::File is happy when setting up the watcher
-        auto absFile = juce::File::getCurrentWorkingDirectory().getChildFile (path);
-        auto result = lua.safe_script_file (absFile.getFullPathName().toStdString(),
-                                            sol::script_pass_on_error);
-        if (!result.valid())
-        {
-            sol::error err = result;
-            std::cerr << "[load_script error] " << err.what() << "\n";
-            return false;
-        }
-        onWatch (absFile.getFullPathName().toStdString());
-        return true;
-    });
+    daw.set_function ("load_script",
+        [&lua, &eventBroker, onWatch](const std::string& path) -> bool {
+            auto absFile = juce::File::getCurrentWorkingDirectory().getChildFile (path);
+            auto result = lua.safe_script_file (absFile.getFullPathName().toStdString(),
+                                                sol::script_pass_on_error);
+            if (!result.valid())
+            {
+                sol::error err = result;
+                std::cerr << "[load_script error] " << err.what() << "\n";
+                return false;
+            }
+            onWatch (absFile.getFullPathName().toStdString());
+            std::ostringstream o;
+            o << "{\"path\":\"" << absFile.getFullPathName().toStdString()
+              << "\",\"trigger\":\"load\"}";
+            emitAuto (eventBroker, "script_load", o.str());
+            return true;
+        });
 
     // --- persistent store ---
 
@@ -1314,7 +1369,8 @@ class LuaRepl : private juce::Thread
 public:
     LuaRepl (te::Edit& edit, MidiEventQueue& midiQueue,
              EventBroker& eventBroker, PythonHost& pythonHost)
-        : juce::Thread ("lua-repl"), edit (edit), midiQueue (midiQueue)
+        : juce::Thread ("lua-repl"), edit (edit), midiQueue (midiQueue),
+          eventBroker (eventBroker)
     {
         lua.open_libraries (sol::lib::base, sol::lib::string,
                             sol::lib::table,  sol::lib::math,
@@ -1471,7 +1527,7 @@ private:
     {
         MidiEvent e;
         while (midiQueue.pop (e))
-            dispatchMidiToLua (lua, e);
+            dispatchMidiToLua (lua, e, eventBroker);
     }
 
     // -----------------------------------------------------------------------
@@ -1521,6 +1577,9 @@ private:
         {
             std::cout << "[hot-reload] reloaded: "
                       << juce::File (watch.path).getFileName() << "\n> " << std::flush;
+            std::ostringstream o;
+            o << "{\"path\":\"" << watch.path << "\",\"trigger\":\"hot_reload\"}";
+            emitAuto (eventBroker, "script_load", o.str());
         }
         else
         {
@@ -1653,6 +1712,11 @@ private:
                     sol::error err = result;
                     std::cerr << "\n[on_end error] " << err.what() << "\n> " << std::flush;
                 }
+
+                std::ostringstream o;
+                o << "{\"track\":" << t << ",\"slot\":" << s
+                  << ",\"name\":\"" << clip->getName().toStdString() << "\"}";
+                emitAuto (eventBroker, "follow", o.str());
             }
 
             st.prevState = cur;
@@ -1676,6 +1740,7 @@ private:
 
     te::Edit&                          edit;
     MidiEventQueue&                    midiQueue;
+    EventBroker&                       eventBroker;
     sol::state                         lua;
     WatchState                         watch;
     std::unique_ptr<juce::MidiOutput>  midiOutput;

@@ -99,9 +99,13 @@ daw.show_editor(track)   -- open native GUI for first VST on this track
 daw.close_editor(track)
 
 -- Remote eval + event stream (HTTP server on 127.0.0.1:8081)
+--   http://127.0.0.1:8081/                               -- built-in web UI
 --   curl -d 'daw.bpm()' http://127.0.0.1:8081/eval       -- run Lua, get result
 --   curl -N http://127.0.0.1:8081/events                 -- subscribe to events
-daw.emit(name [, table])   -- broadcast JSON to all /events subscribers
+daw.emit(name [, table])        -- broadcast JSON to all /events subscribers
+daw.auto_emit(bool)             -- master switch for engine-published events
+daw.auto_emit_midi_in(bool)     -- gate the (chatty) midi_in stream; off by default
+-- Auto-emitted: transport, clip_launch, clip_stop, follow, script_load, midi_in
 
 -- Diagnostics
 daw.audio_info()

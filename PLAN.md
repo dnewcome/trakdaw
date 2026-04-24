@@ -228,6 +228,20 @@ The premise of the project is that scripts define behavior the engine doesn't kn
 
 If persistent eval or bidirectional push shows up as a real pain point, promote the event channel to WebSocket later — the `daw.emit` API won't change.
 
+### Engine-published events (auto-emit)
+In addition to script-driven `daw.emit`, the engine publishes a fixed set of built-in events so the UI shows something useful with zero script changes:
+
+| Event          | Fired when                                    | Data                                       |
+|----------------|-----------------------------------------------|--------------------------------------------|
+| `transport`    | `daw.play()` / `daw.stop()`                   | `{playing, position}`                      |
+| `clip_launch`  | `daw.clip(t,s).launch()` succeeds             | `{track, slot, name}`                      |
+| `clip_stop`    | `daw.clip(t,s).stop()` runs                   | `{track, slot}`                            |
+| `follow`       | A clip finishes and `on_end` fires            | `{track, slot, name}`                      |
+| `script_load`  | `daw.load_script` or hot-reload succeeds      | `{path, trigger}`                          |
+| `midi_in`      | Any MIDI input message (gated, off by default)| `{type, channel, note/cc/value}`           |
+
+Toggles: `daw.auto_emit(bool)` master switch (default on), `daw.auto_emit_midi_in(bool)` (default off because chatty). Scripts that want a different granularity can disable auto-emit and call `daw.emit` themselves.
+
 ### What's deliberately left out of v1
 - **Auth / access control.** The server binds `127.0.0.1` only; anyone with shell access on the host can already eval. Before exposing to a network, add a token header and a `daw_ro` read-only sandbox.
 - **Replay / history.** Events are fire-and-forget. A late subscriber doesn't see past events. Most visualizations tolerate this; if some don't, add a ring buffer keyed by topic.
