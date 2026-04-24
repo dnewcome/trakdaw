@@ -821,7 +821,7 @@ static void registerDawApi (sol::state& lua,
     });
 
     // daw.load_4osc(trackIdx) — insert Tracktion's built-in 4-oscillator synth
-    daw.set_function ("load_4osc", [&edit](int trackIdx) -> bool {
+    daw.set_function ("load_4osc", [&edit, &eventBroker](int trackIdx) -> bool {
         struct Args { te::Edit* edit; int idx; bool ok; };
         Args args { &edit, trackIdx, false };
         juce::MessageManager::getInstance()->callFunctionOnMessageThread ([] (void* ctx) -> void*
@@ -837,7 +837,13 @@ static void registerDawApi (sol::state& lua,
             return nullptr;
         }, &args);
         if (args.ok)
+        {
             std::cout << "[4osc] loaded on track " << trackIdx << "\n> " << std::flush;
+            std::ostringstream o;
+            o << "{\"track\":" << trackIdx
+              << ",\"name\":\"4osc\",\"format\":\"tracktion\",\"ok\":true}";
+            emitAuto (eventBroker, "plugin_load", o.str());
+        }
         return args.ok;
     });
 
@@ -873,7 +879,7 @@ static void registerDawApi (sol::state& lua,
     // Tracktion built-ins like 4osc use their own UI path.
     // Returns true on success.
     daw.set_function ("show_editor",
-        [&edit, &pluginEditors](int trackIdx) -> bool {
+        [&edit, &pluginEditors, &eventBroker](int trackIdx) -> bool {
             struct Args {
                 te::Edit*         edit;
                 int               idx;
@@ -921,12 +927,20 @@ static void registerDawApi (sol::state& lua,
             else
                 std::cerr << "[show_editor error] " << args.err
                           << "\n> " << std::flush;
+            {
+                std::ostringstream o;
+                o << "{\"track\":" << trackIdx
+                  << ",\"action\":\"open\",\"ok\":" << (args.ok ? "true" : "false");
+                if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+                o << "}";
+                emitAuto (eventBroker, "plugin_editor", o.str());
+            }
             return args.ok;
         });
 
     // daw.close_editor(trackIdx)
     daw.set_function ("close_editor",
-        [&pluginEditors](int trackIdx) {
+        [&pluginEditors, &eventBroker](int trackIdx) {
             struct Args { PluginEditorMap* wins; int idx; };
             Args args { &pluginEditors, trackIdx };
             juce::MessageManager::getInstance()->callFunctionOnMessageThread (
@@ -935,9 +949,12 @@ static void registerDawApi (sol::state& lua,
                     a->wins->erase (a->idx);
                     return nullptr;
                 }, &args);
+            std::ostringstream o;
+            o << "{\"track\":" << trackIdx << ",\"action\":\"close\"}";
+            emitAuto (eventBroker, "plugin_editor", o.str());
         });
 
-    daw.set_function ("open_audio_device", [&edit](const std::string& name) {
+    daw.set_function ("open_audio_device", [&edit, &eventBroker](const std::string& name) {
         auto& adm = edit.engine.getDeviceManager().deviceManager;
         juce::AudioDeviceManager::AudioDeviceSetup setup;
         adm.getAudioDeviceSetup (setup);
@@ -950,6 +967,11 @@ static void registerDawApi (sol::state& lua,
             std::cout << "[audio] opened: " << name << "\n> " << std::flush;
         else
             std::cout << "[audio error] " << err << "\n> " << std::flush;
+        std::ostringstream o;
+        o << "{\"name\":\"" << name << "\",\"ok\":" << (err.isEmpty() ? "true" : "false");
+        if (! err.isEmpty()) o << ",\"error\":\"" << err.toStdString() << "\"";
+        o << "}";
+        emitAuto (eventBroker, "audio_device_open", o.str());
     });
 
     daw.set_function ("audio_info", [&edit]() {
@@ -1122,7 +1144,7 @@ static void registerDawApi (sol::state& lua,
     });
 
     daw.set_function ("open_midi_output",
-        [&midiOutput](const std::string& name) -> bool {
+        [&midiOutput, &eventBroker](const std::string& name) -> bool {
             struct Args { std::unique_ptr<juce::MidiOutput>* out; std::string name; bool ok; };
             Args args { &midiOutput, name, false };
             juce::MessageManager::getInstance()->callFunctionOnMessageThread (
@@ -1146,6 +1168,9 @@ static void registerDawApi (sol::state& lua,
                     std::cerr << "[midi out] not found: " << a->name << "\n";
                     return nullptr;
                 }, &args);
+            std::ostringstream o;
+            o << "{\"name\":\"" << name << "\",\"ok\":" << (args.ok ? "true" : "false") << "}";
+            emitAuto (eventBroker, "midi_output_open", o.str());
             return args.ok;
         });
 
@@ -1252,7 +1277,7 @@ static void registerDawApi (sol::state& lua,
     // Enables the named Tracktion MidiInputDevice and routes it to the
     // given track (1-based). Returns true on success.
     daw.set_function ("assign_midi_input",
-        [&edit](const std::string& name, int trackIdx) -> bool {
+        [&edit, &eventBroker](const std::string& name, int trackIdx) -> bool {
             struct Args { te::Edit* edit; std::string name; int idx;
                           bool ok; std::string err; };
             Args args { &edit, name, trackIdx, false, {} };
@@ -1294,12 +1319,21 @@ static void registerDawApi (sol::state& lua,
             else
                 std::cerr << "[assign_midi_input error] " << args.err
                           << "\n> " << std::flush;
+            {
+                std::ostringstream o;
+                o << "{\"device\":\"" << name << "\""
+                  << ",\"track\":" << trackIdx
+                  << ",\"action\":\"assign\",\"ok\":" << (args.ok ? "true" : "false");
+                if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+                o << "}";
+                emitAuto (eventBroker, "midi_input_route", o.str());
+            }
             return args.ok;
         });
 
     // daw.unassign_midi_input(deviceName, trackIdx)
     daw.set_function ("unassign_midi_input",
-        [&edit](const std::string& name, int trackIdx) -> bool {
+        [&edit, &eventBroker](const std::string& name, int trackIdx) -> bool {
             struct Args { te::Edit* edit; std::string name; int idx;
                           bool ok; std::string err; };
             Args args { &edit, name, trackIdx, false, {} };
@@ -1336,6 +1370,15 @@ static void registerDawApi (sol::state& lua,
             if (! args.ok)
                 std::cerr << "[unassign_midi_input error] " << args.err
                           << "\n> " << std::flush;
+            {
+                std::ostringstream o;
+                o << "{\"device\":\"" << name << "\""
+                  << ",\"track\":" << trackIdx
+                  << ",\"action\":\"unassign\",\"ok\":" << (args.ok ? "true" : "false");
+                if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+                o << "}";
+                emitAuto (eventBroker, "midi_input_route", o.str());
+            }
             return args.ok;
         });
 
@@ -1383,9 +1426,18 @@ static void registerDawApi (sol::state& lua,
     // Load a VST3 plugin from `path` and insert it at the front of the
     // given track's plugin chain. trackIdx is 1-based.
     // Returns true on success, false + prints error on failure.
-    daw.set_function ("load_plugin", [&edit](int trackIdx, const std::string& path) -> bool {
-        struct Args { te::Edit* edit; int trackIdx; std::string path; bool ok; std::string err; };
-        Args args { &edit, trackIdx, path, false, {} };
+    daw.set_function ("load_plugin",
+        [&edit, &eventBroker](int trackIdx, const std::string& path) -> bool {
+        struct Args {
+            te::Edit*   edit;
+            int         trackIdx;
+            std::string path;
+            bool        ok;
+            std::string err;
+            std::string name;      // filled in on success
+            std::string format;
+        };
+        Args args { &edit, trackIdx, path, false, {}, {}, {} };
 
         juce::MessageManager::getInstance()->callFunctionOnMessageThread ([] (void* ctx) -> void*
         {
@@ -1439,18 +1491,26 @@ static void registerDawApi (sol::state& lua,
             a->edit->getTransport().stop (false, false);
             if (wasPlaying)
                 a->edit->getTransport().play (false);
+            a->name   = results[0]->name.toStdString();
+            a->format = results[0]->pluginFormatName.toStdString();
             a->ok = true;
             return nullptr;
         }, &args);
 
+        std::ostringstream o;
+        o << "{\"track\":" << trackIdx
+          << ",\"name\":\"" << args.name << "\""
+          << ",\"format\":\"" << args.format << "\""
+          << ",\"path\":\"" << path << "\""
+          << ",\"ok\":" << (args.ok ? "true" : "false");
+        if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+        o << "}";
+        emitAuto (eventBroker, "plugin_load", o.str());
+
         if (args.ok)
-        {
             std::cout << "[load_plugin] loaded on track " << trackIdx << "\n> " << std::flush;
-        }
         else
-        {
             std::cerr << "[load_plugin error] " << args.err << "\n> " << std::flush;
-        }
         return args.ok;
     });
 

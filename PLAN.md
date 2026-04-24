@@ -231,14 +231,19 @@ If persistent eval or bidirectional push shows up as a real pain point, promote 
 ### Engine-published events (auto-emit)
 In addition to script-driven `daw.emit`, the engine publishes a fixed set of built-in events so the UI shows something useful with zero script changes:
 
-| Event          | Fired when                                    | Data                                       |
-|----------------|-----------------------------------------------|--------------------------------------------|
-| `transport`    | `daw.play()` / `daw.stop()`                   | `{playing, position}`                      |
-| `clip_launch`  | `daw.clip(t,s).launch()` succeeds             | `{track, slot, name}`                      |
-| `clip_stop`    | `daw.clip(t,s).stop()` runs                   | `{track, slot}`                            |
-| `follow`       | A clip finishes and `on_end` fires            | `{track, slot, name}`                      |
-| `script_load`  | `daw.load_script` or hot-reload succeeds      | `{path, trigger}`                          |
-| `midi_in`      | Any MIDI input message (gated, off by default)| `{type, channel, note/cc/value}`           |
+| Event              | Fired when                                    | Data                                       |
+|--------------------|-----------------------------------------------|--------------------------------------------|
+| `transport`        | `daw.play()` / `daw.stop()`                   | `{playing, position}`                      |
+| `clip_launch`      | `daw.clip(t,s).launch()` succeeds             | `{track, slot, name}`                      |
+| `clip_stop`        | `daw.clip(t,s).stop()` runs                   | `{track, slot}`                            |
+| `follow`           | A clip finishes and `on_end` fires            | `{track, slot, name}`                      |
+| `script_load`      | `daw.load_script` or hot-reload succeeds      | `{path, trigger}`                          |
+| `midi_in`          | Any MIDI input message (gated, off by default)| `{type, channel, note/cc/value}`           |
+| `plugin_load`      | `daw.load_4osc` / `daw.load_plugin`           | `{track, name, format, ok, error?}`        |
+| `plugin_editor`    | `daw.show_editor` / `daw.close_editor`        | `{track, action, ok?, error?}`             |
+| `audio_device_open`| `daw.open_audio_device`                       | `{name, ok, error?}`                       |
+| `midi_output_open` | `daw.open_midi_output`                        | `{name, ok}`                               |
+| `midi_input_route` | `daw.assign_midi_input` / `unassign_midi_input`| `{device, track, action, ok, error?}`     |
 
 Toggles: `daw.auto_emit(bool)` master switch (default on), `daw.auto_emit_midi_in(bool)` (default off because chatty). Scripts that want a different granularity can disable auto-emit and call `daw.emit` themselves.
 
