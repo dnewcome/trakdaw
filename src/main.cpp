@@ -654,6 +654,117 @@ private:
 using PluginEditorMap = std::map<int, std::unique_ptr<PluginEditorWindow>>;
 
 //==============================================================================
+// Scheduler — beat-based one-shot and repeating timers, fired on the REPL
+// thread's poll loop (~10ms granularity). Delay/interval are specified in
+// beats and converted to wall-clock ms at schedule time using current BPM;
+// pending tasks do not re-scale if BPM changes mid-flight.
+//
+// Callbacks receive (count) — 1 on first call, 2 on second, etc. A callback
+// returning boolean `false` cancels its own task; any other return (including
+// nil) continues. Errors are logged but don't abort future tasks.
+//==============================================================================
+class Scheduler
+{
+public:
+    int schedule (double delayBeats, double intervalBeats,
+                  sol::protected_function fn, double bpm)
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        const int id     = ++nextId;
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const double bms = 60000.0 / bpm;
+        tasks.push_back ({ id, now + delayBeats * bms, intervalBeats * bms,
+                           std::move (fn), 0 });
+        return id;
+    }
+
+    bool cancel (int id)
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        auto it = std::remove_if (tasks.begin(), tasks.end(),
+                                  [id](auto& t) { return t.id == id; });
+        const bool found = (it != tasks.end());
+        tasks.erase (it, tasks.end());
+        return found;
+    }
+
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        tasks.clear();
+    }
+
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        return tasks.size();
+    }
+
+    // Called from the REPL poll loop. Fires any ready tasks, drops one-shots.
+    void tick()
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+
+        struct Fire { int id; int count; sol::protected_function fn; };
+        std::vector<Fire> toFire;
+        {
+            std::lock_guard<std::mutex> lock (mu);
+            for (auto it = tasks.begin(); it != tasks.end(); )
+            {
+                if (now < it->triggerTimeMs) { ++it; continue; }
+
+                ++it->callCount;
+                toFire.push_back ({ it->id, it->callCount, it->fn });
+
+                if (it->intervalMs > 0)
+                {
+                    // Catch up if we fell behind (e.g. after a stall)
+                    do { it->triggerTimeMs += it->intervalMs; }
+                    while (now >= it->triggerTimeMs);
+                    ++it;
+                }
+                else
+                {
+                    it = tasks.erase (it);
+                }
+            }
+        }
+
+        for (auto& f : toFire)
+        {
+            auto result = f.fn (f.count);
+            if (! result.valid())
+            {
+                sol::error err = result;
+                std::cerr << "\n[scheduler error] " << err.what()
+                          << "\n> " << std::flush;
+                continue;
+            }
+            if (result.return_count() > 0)
+            {
+                sol::object first = result;
+                if (first.get_type() == sol::type::boolean && first.as<bool>() == false)
+                    cancel (f.id);
+            }
+        }
+    }
+
+private:
+    struct ScheduledTask
+    {
+        int    id;
+        double triggerTimeMs;    // wall-clock target
+        double intervalMs;       // 0 = one-shot
+        sol::protected_function fn;
+        int    callCount;
+    };
+
+    mutable std::mutex         mu;
+    std::vector<ScheduledTask> tasks;
+    int                        nextId = 0;
+};
+
+//==============================================================================
 // Register the `daw` table.
 // onWatch(path) is called when load_script succeeds — lets LuaRepl set up watching.
 //==============================================================================
@@ -663,6 +774,7 @@ static void registerDawApi (sol::state& lua,
                              std::unique_ptr<juce::MidiOutput>& midiOutput,
                              PluginEditorMap& pluginEditors,
                              EventBroker& eventBroker,
+                             Scheduler& scheduler,
                              std::function<void(const std::string&)> onWatch,
                              PythonHost& pythonHost)
 {
@@ -1093,6 +1205,30 @@ static void registerDawApi (sol::state& lua,
     daw.set_function ("auto_emit_midi_in",
         [&eventBroker](bool on) { eventBroker.autoEmitMidiIn.store (on); });
 
+    // --- scheduler ---
+    // daw.after(beats, fn)     — fire once after `beats` from now
+    // daw.every(beats, fn)     — fire every `beats`. Return false to stop.
+    // daw.cancel(id)           — cancel a specific task
+    // daw.cancel_all()         — cancel everything pending
+    //
+    // Beats convert to ms at schedule time using current BPM; pending
+    // tasks don't rescale if BPM changes. Fires regardless of transport
+    // state (so you can prototype without pressing play).
+    daw.set_function ("after",
+        [&edit, &scheduler](double beats, sol::protected_function fn) -> int {
+            return scheduler.schedule (beats, 0.0, std::move (fn),
+                                       edit.tempoSequence.getTempo (0)->getBpm());
+        });
+    daw.set_function ("every",
+        [&edit, &scheduler](double beats, sol::protected_function fn) -> int {
+            return scheduler.schedule (beats, beats, std::move (fn),
+                                       edit.tempoSequence.getTempo (0)->getBpm());
+        });
+    daw.set_function ("cancel",
+        [&scheduler](int id) -> bool { return scheduler.cancel (id); });
+    daw.set_function ("cancel_all",
+        [&scheduler]() { scheduler.clear(); });
+
     // --- native Tracktion MIDI input routing ---
     // Unlike the raw juce::MidiInput path (MidiEventQueue → on_midi), this
     // uses Tracktion's DeviceManager so MIDI flows straight into a track's
@@ -1377,7 +1513,7 @@ public:
                             sol::lib::io,     sol::lib::os);
 
         registerDawApi (lua, edit, midiQueue, midiOutput, pluginEditors,
-            eventBroker,
+            eventBroker, scheduler,
             [this](const std::string& path) {
                 watch.path  = path;
                 watch.mtime = juce::File (path).getLastModificationTime();
@@ -1572,6 +1708,10 @@ private:
 
         watch.pending = false;
 
+        // Stale scheduler tasks from the previous script version would hold
+        // dangling Lua closures — clear before running the reloaded script.
+        scheduler.clear();
+
         auto result = lua.safe_script_file (watch.path, sol::script_pass_on_error);
         if (result.valid())
         {
@@ -1647,6 +1787,7 @@ private:
             checkFileForChanges();
             reloadIfReady();
             checkFollowActions();
+            scheduler.tick();
         }
     }
 
@@ -1742,6 +1883,7 @@ private:
     MidiEventQueue&                    midiQueue;
     EventBroker&                       eventBroker;
     sol::state                         lua;
+    Scheduler                          scheduler;
     WatchState                         watch;
     std::unique_ptr<juce::MidiOutput>  midiOutput;
     PluginEditorMap                    pluginEditors;

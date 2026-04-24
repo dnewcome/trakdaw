@@ -98,6 +98,12 @@ daw.send_midi_raw(b1 [, b2 [, b3]])            -- CC / PC / arbitrary bytes
 daw.show_editor(track)   -- open native GUI for first VST on this track
 daw.close_editor(track)
 
+-- Scheduler (beat-based, fires on the REPL poll thread)
+daw.after(beats, fn)             -- one-shot timer
+daw.every(beats, fn)             -- repeating timer; fn returns false to stop
+daw.cancel(id)                   -- cancel by id returned from after/every
+daw.cancel_all()                 -- cancel everything pending
+
 -- Remote eval + event stream (HTTP server on 127.0.0.1:8081)
 --   http://127.0.0.1:8081/                               -- built-in web UI
 --   curl -d 'daw.bpm()' http://127.0.0.1:8081/eval       -- run Lua, get result
