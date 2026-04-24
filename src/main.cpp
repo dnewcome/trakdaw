@@ -22,9 +22,15 @@ namespace py = pybind11;
 #include <sys/select.h>
 #include <unistd.h>
 #include <cmath>
+#include <future>
 #include <map>
 #include <mutex>
 #include <queue>
+#include <sstream>
+
+// cpp-httplib must be included after JuceHeader so its socket symbols don't
+// collide with anything JUCE pulls in via X11/Cocoa headers.
+#include <httplib.h>
 
 namespace te = tracktion;
 using namespace tracktion::literals;
@@ -419,12 +425,50 @@ static void dispatchMidiToLua (sol::state& lua, const MidiEvent& e)
 }
 
 //==============================================================================
+// PluginEditorWindow — hosts a juce::AudioProcessorEditor in a DocumentWindow
+// so VST plugin GUIs can be opened for debugging. Used by daw.show_editor.
+//==============================================================================
+class PluginEditorWindow : public juce::DocumentWindow
+{
+public:
+    PluginEditorWindow (const juce::String& name,
+                        juce::AudioProcessorEditor* editor,
+                        std::function<void()> onCloseRequested)
+        : juce::DocumentWindow (name, juce::Colours::darkgrey,
+                                juce::DocumentWindow::closeButton),
+          onClose (std::move (onCloseRequested))
+    {
+        setUsingNativeTitleBar (true);
+        setContentOwned (editor, true);       // window now owns + deletes editor
+        setResizable (editor->isResizable(), false);
+        centreWithSize (getWidth(), getHeight());
+        setVisible (true);
+        toFront (true);
+    }
+
+    void closeButtonPressed() override
+    {
+        // Defer deletion — we're inside the window's own event handler, so
+        // we can't let the caller destroy us synchronously.
+        if (onClose)
+            juce::MessageManager::callAsync (onClose);
+    }
+
+private:
+    std::function<void()> onClose;
+};
+
+using PluginEditorMap = std::map<int, std::unique_ptr<PluginEditorWindow>>;
+
+//==============================================================================
 // Register the `daw` table.
 // onWatch(path) is called when load_script succeeds — lets LuaRepl set up watching.
 //==============================================================================
 static void registerDawApi (sol::state& lua,
                              te::Edit& edit,
                              MidiEventQueue& midiQueue,
+                             std::unique_ptr<juce::MidiOutput>& midiOutput,
+                             PluginEditorMap& pluginEditors,
                              std::function<void(const std::string&)> onWatch,
                              PythonHost& pythonHost)
 {
@@ -503,6 +547,77 @@ static void registerDawApi (sol::state& lua,
             return nullptr;
         }, &args);
     });
+
+    // daw.show_editor(trackIdx)
+    // Open a window hosting the native GUI of the first external plugin on
+    // the given track. Useful for debugging when running an otherwise
+    // headless session. Only supports te::ExternalPlugin (VST2/VST3) —
+    // Tracktion built-ins like 4osc use their own UI path.
+    // Returns true on success.
+    daw.set_function ("show_editor",
+        [&edit, &pluginEditors](int trackIdx) -> bool {
+            struct Args {
+                te::Edit*         edit;
+                int               idx;
+                PluginEditorMap*  wins;
+                bool              ok;
+                std::string       err;
+            };
+            Args args { &edit, trackIdx, &pluginEditors, false, {} };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a     = static_cast<Args*> (ctx);
+                    auto  tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size())
+                        { a->err = "track index out of range"; return nullptr; }
+
+                    auto* at = tracks[a->idx - 1];
+                    for (auto* plug : at->pluginList)
+                    {
+                        auto* ep = dynamic_cast<te::ExternalPlugin*> (plug);
+                        if (! ep) continue;
+                        auto* api = ep->getAudioPluginInstance();
+                        if (! api) continue;
+                        auto* editor = api->createEditorIfNeeded();
+                        if (! editor)
+                            { a->err = "plugin has no editor"; return nullptr; }
+
+                        // Replace any existing window for this track
+                        a->wins->erase (a->idx);
+                        int idx    = a->idx;
+                        auto* wins = a->wins;
+                        (*a->wins)[a->idx] = std::make_unique<PluginEditorWindow> (
+                            plug->getName(), editor,
+                            [wins, idx] { wins->erase (idx); });
+                        a->ok = true;
+                        return nullptr;
+                    }
+                    a->err = "no external plugin on this track";
+                    return nullptr;
+                }, &args);
+
+            if (args.ok)
+                std::cout << "[show_editor] opened for track " << trackIdx
+                          << "\n> " << std::flush;
+            else
+                std::cerr << "[show_editor error] " << args.err
+                          << "\n> " << std::flush;
+            return args.ok;
+        });
+
+    // daw.close_editor(trackIdx)
+    daw.set_function ("close_editor",
+        [&pluginEditors](int trackIdx) {
+            struct Args { PluginEditorMap* wins; int idx; };
+            Args args { &pluginEditors, trackIdx };
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    a->wins->erase (a->idx);
+                    return nullptr;
+                }, &args);
+        });
 
     daw.set_function ("open_audio_device", [&edit](const std::string& name) {
         auto& adm = edit.engine.getDeviceManager().deviceManager;
@@ -623,8 +738,9 @@ static void registerDawApi (sol::state& lua,
     // --- MIDI ---
 
     // daw.inject_midi(note, vel [, channel=1])
-    // Pushes a synthetic note-on into the MIDI queue.
-    // Dispatched on the next drainMidi() call (≤10ms).
+    // Pushes a synthetic note-on into the MIDI queue, which fires the Lua
+    // on_midi(msg) callback. Does NOT play any instrument — for that, use
+    // daw.note_on / daw.note_off below.
     daw.set_function ("inject_midi", [&midiQueue](int note, int vel, sol::optional<int> ch) {
         MidiEvent e;
         e.data[0]         = uint8_t (0x90 | ((ch.value_or (1) - 1) & 0x0F));
@@ -634,6 +750,98 @@ static void registerDawApi (sol::state& lua,
         e.receiveTimeSecs = juce::Time::getMillisecondCounterHiRes() * 0.001;
         midiQueue.push (e);
     });
+
+    // daw.note_on(track, note, vel [, channel=1])
+    // daw.note_off(track, note [, channel=1])
+    // Send a synthetic MIDI message directly to the instrument loaded on
+    // the given track (1-based) via AudioTrack::injectLiveMidiMessage —
+    // the same path Tracktion uses for live controller input.
+    daw.set_function ("note_on",
+        [&edit](int trackIdx, int note, int vel, sol::optional<int> ch) {
+            int channel = ch.value_or (1);
+            juce::MessageManager::callAsync ([&edit, trackIdx, note, vel, channel] {
+                auto tr = te::getAudioTracks (edit);
+                if (trackIdx < 1 || trackIdx > tr.size()) return;
+                tr[trackIdx - 1]->injectLiveMidiMessage (
+                    juce::MidiMessage::noteOn (channel, note, (juce::uint8) vel), {});
+            });
+        });
+
+    daw.set_function ("note_off",
+        [&edit](int trackIdx, int note, sol::optional<int> ch) {
+            int channel = ch.value_or (1);
+            juce::MessageManager::callAsync ([&edit, trackIdx, note, channel] {
+                auto tr = te::getAudioTracks (edit);
+                if (trackIdx < 1 || trackIdx > tr.size()) return;
+                tr[trackIdx - 1]->injectLiveMidiMessage (
+                    juce::MidiMessage::noteOff (channel, note), {});
+            });
+        });
+
+    // --- MIDI output to external devices ---
+    // daw.list_midi_outputs(), daw.open_midi_output(name),
+    // daw.send_midi(note, vel [, channel])
+    //   send_midi with vel == 0 sends note-off; otherwise note-on.
+    // daw.send_midi_raw(b1 [, b2 [, b3]]) for arbitrary bytes (CC, PC, etc).
+
+    // getAvailableDevices / openDevice both assert message-thread; wrap.
+    daw.set_function ("list_midi_outputs", []() {
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void*) -> void* {
+                for (auto& info : juce::MidiOutput::getAvailableDevices())
+                    std::cout << "  " << info.name.toStdString() << "\n";
+                return nullptr;
+            }, nullptr);
+    });
+
+    daw.set_function ("open_midi_output",
+        [&midiOutput](const std::string& name) -> bool {
+            struct Args { std::unique_ptr<juce::MidiOutput>* out; std::string name; bool ok; };
+            Args args { &midiOutput, name, false };
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    for (auto& info : juce::MidiOutput::getAvailableDevices())
+                    {
+                        if (info.name.containsIgnoreCase (juce::String (a->name)))
+                        {
+                            *a->out = juce::MidiOutput::openDevice (info.identifier);
+                            if (*a->out)
+                            {
+                                (*a->out)->startBackgroundThread();
+                                std::cout << "[midi out] opened: "
+                                          << info.name.toStdString() << "\n";
+                                a->ok = true;
+                                return nullptr;
+                            }
+                        }
+                    }
+                    std::cerr << "[midi out] not found: " << a->name << "\n";
+                    return nullptr;
+                }, &args);
+            return args.ok;
+        });
+
+    daw.set_function ("send_midi",
+        [&midiOutput](int note, int vel, sol::optional<int> ch) {
+            if (! midiOutput) return;
+            int channel = ch.value_or (1);
+            auto msg = vel > 0
+                ? juce::MidiMessage::noteOn  (channel, note, (juce::uint8) vel)
+                : juce::MidiMessage::noteOff (channel, note);
+            midiOutput->sendMessageNow (msg);
+        });
+
+    daw.set_function ("send_midi_raw",
+        [&midiOutput](int b1, sol::optional<int> b2, sol::optional<int> b3) {
+            if (! midiOutput) return;
+            const juce::uint8 bytes[3] = {
+                (juce::uint8) (b1 & 0xFF),
+                (juce::uint8) (b2.value_or (0) & 0xFF),
+                (juce::uint8) (b3.value_or (0) & 0xFF) };
+            int size = b3 ? 3 : (b2 ? 2 : 1);
+            midiOutput->sendMessageNow (juce::MidiMessage (bytes, size));
+        });
 
     // --- scripting ---
 
@@ -802,7 +1010,7 @@ public:
                             sol::lib::table,  sol::lib::math,
                             sol::lib::io,     sol::lib::os);
 
-        registerDawApi (lua, edit, midiQueue,
+        registerDawApi (lua, edit, midiQueue, midiOutput, pluginEditors,
             [this](const std::string& path) {
                 watch.path  = path;
                 watch.mtime = juce::File (path).getLastModificationTime();
@@ -814,9 +1022,87 @@ public:
     }
 
     void start()    { startThread(); }
-    void shutdown() { signalThreadShouldExit(); stopThread (2000); }
+    void shutdown()
+    {
+        signalThreadShouldExit();
+        stopThread (2000);
+        // Plugin editor windows own live VST editor components — they must
+        // be destroyed on the message thread before the plugins themselves.
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void* ctx) -> void* {
+                static_cast<PluginEditorMap*> (ctx)->clear();
+                return nullptr;
+            }, &pluginEditors);
+    }
+
+    // Queue a Lua chunk for execution on the REPL thread. Returns a future
+    // that resolves to the formatted result (or error message). Safe to
+    // call from any thread; the chunk runs on the REPL thread on its next
+    // poll cycle (≤10ms).
+    std::future<std::string> evalAsync (std::string code)
+    {
+        auto promise = std::make_shared<std::promise<std::string>>();
+        auto future  = promise->get_future();
+        {
+            std::lock_guard<std::mutex> lock (evalMutex);
+            evalQueue.push ({ std::move (code), promise });
+        }
+        return future;
+    }
 
 private:
+    // -----------------------------------------------------------------------
+    // Format a sol::object into a string (mirror of printValue, for HTTP).
+    // -----------------------------------------------------------------------
+    static void formatValue (std::ostringstream& out, sol::object obj)
+    {
+        switch (obj.get_type())
+        {
+            case sol::type::nil:     out << "nil"; break;
+            case sol::type::boolean: out << (obj.as<bool>() ? "true" : "false"); break;
+            case sol::type::number:  out << obj.as<double>(); break;
+            case sol::type::string:  out << obj.as<std::string>(); break;
+            default:                 out << "(value)"; break;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Drain the eval queue. Called from the REPL poll loop.
+    // -----------------------------------------------------------------------
+    void drainEvalQueue()
+    {
+        std::queue<EvalRequest> local;
+        {
+            std::lock_guard<std::mutex> lock (evalMutex);
+            std::swap (local, evalQueue);
+        }
+        while (! local.empty())
+        {
+            auto req = std::move (local.front());
+            local.pop();
+
+            std::ostringstream out;
+            auto r = lua.safe_script ("return " + req.code, sol::script_pass_on_error);
+            if (! r.valid())
+                r = lua.safe_script (req.code, sol::script_pass_on_error);
+
+            if (! r.valid())
+            {
+                sol::error err = r;
+                out << "error: " << err.what();
+            }
+            else
+            {
+                for (int i = 0; i < (int) r.return_count(); ++i)
+                {
+                    if (i > 0) out << "\t";
+                    formatValue (out, r[i]);
+                }
+            }
+            req.promise->set_value (out.str());
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Evaluate one line (expression first, then statement)
     // -----------------------------------------------------------------------
@@ -940,7 +1226,9 @@ private:
         std::cout << "\ntrakdaw Lua REPL (Phase 4 — hot reload)\n";
         std::cout << "  daw.play() / daw.stop()              transport\n";
         std::cout << "  daw.clip(t,s).launch()               launch clip (1-based)\n";
-        std::cout << "  daw.inject_midi(note, vel)           fake MIDI note-on\n";
+        std::cout << "  daw.inject_midi(note, vel)           fake MIDI to on_midi callback\n";
+        std::cout << "  daw.note_on(t, note, vel)            play instrument on track t\n";
+        std::cout << "  daw.note_off(t, note)                stop instrument note\n";
         std::cout << "  daw.load_script(\"path.lua\")          load + watch for changes\n";
         std::cout << "  daw.store.x = val                    persistent across reloads\n";
         std::cout << "  function on_midi(m) ... end          MIDI callback\n";
@@ -985,6 +1273,7 @@ private:
             }
 
             drainMidi();
+            drainEvalQueue();
             checkFileForChanges();
             reloadIfReady();
             checkFollowActions();
@@ -1068,11 +1357,69 @@ private:
         int         pollCount = 0;
     };
 
-    te::Edit&       edit;
-    MidiEventQueue& midiQueue;
-    sol::state      lua;
-    WatchState      watch;
+    struct EvalRequest
+    {
+        std::string code;
+        std::shared_ptr<std::promise<std::string>> promise;
+    };
+
+    te::Edit&                          edit;
+    MidiEventQueue&                    midiQueue;
+    sol::state                         lua;
+    WatchState                         watch;
+    std::unique_ptr<juce::MidiOutput>  midiOutput;
+    PluginEditorMap                    pluginEditors;
     std::map<std::pair<int,int>, FollowState> followStates;
+    std::mutex                         evalMutex;
+    std::queue<EvalRequest>            evalQueue;
+};
+
+//==============================================================================
+// HttpServer — exposes POST /eval which runs a Lua chunk on the REPL thread
+// and returns its formatted result. Listens on its own thread.
+//==============================================================================
+class HttpServer : private juce::Thread
+{
+public:
+    HttpServer (LuaRepl& repl, int port)
+        : juce::Thread ("http-server"), repl (repl), port (port) {}
+
+    void start() { startThread(); }
+
+    void shutdown()
+    {
+        signalThreadShouldExit();
+        svr.stop();          // unblocks listen()
+        stopThread (2000);
+    }
+
+private:
+    void run() override
+    {
+        svr.Post ("/eval", [this] (const httplib::Request& req,
+                                   httplib::Response& res)
+        {
+            auto fut = repl.evalAsync (req.body);
+            if (fut.wait_for (std::chrono::seconds (5))
+                  == std::future_status::ready)
+            {
+                res.set_content (fut.get(), "text/plain");
+            }
+            else
+            {
+                res.status = 504;
+                res.set_content ("eval timeout\n", "text/plain");
+            }
+        });
+
+        std::cout << "[http] listening on http://127.0.0.1:" << port
+                  << "/eval\n" << std::flush;
+        svr.listen ("127.0.0.1", port);
+    }
+
+    LuaRepl&         repl;
+    int              port;
+    httplib::Server  svr;
 };
 
 //==============================================================================
@@ -1236,10 +1583,15 @@ public:
         // 7. Lua REPL
         repl = std::make_unique<LuaRepl> (*edit, midiQueue, *pythonHost);
         repl->start();
+
+        // 8. HTTP server (POST /eval — runs Lua chunks remotely)
+        httpServer = std::make_unique<HttpServer> (*repl, 8081);
+        httpServer->start();
     }
 
     void shutdown() override
     {
+        if (httpServer)  { httpServer->shutdown();  httpServer.reset(); }
         if (repl)        { repl->shutdown();        repl.reset(); }
         if (pythonHost)  { pythonHost->shutdown();  pythonHost.reset(); }
         g_pyEdit = nullptr;
@@ -1272,6 +1624,7 @@ private:
     std::vector<std::unique_ptr<juce::MidiInput>> midiInputs;
     std::unique_ptr<PythonHost>                   pythonHost;
     std::unique_ptr<LuaRepl>                      repl;
+    std::unique_ptr<HttpServer>                   httpServer;
 };
 
 //==============================================================================

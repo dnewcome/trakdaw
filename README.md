@@ -84,7 +84,23 @@ daw.on_end(track, slot, function(info) ... end)  -- callback when clip finishes
 daw.trigger_follow(track, slot)                  -- manually fire callback (testing)
 
 -- MIDI
-daw.inject_midi(note, velocity [, channel])  -- synthetic note-on
+daw.inject_midi(note, velocity [, channel])    -- fires Lua on_midi callback
+daw.note_on(track, note, velocity [, channel]) -- play instrument on track
+daw.note_off(track, note [, channel])          -- stop instrument note
+
+-- MIDI output to external devices
+daw.list_midi_outputs()
+daw.open_midi_output(name)
+daw.send_midi(note, velocity [, channel])      -- vel 0 → note-off
+daw.send_midi_raw(b1 [, b2 [, b3]])            -- CC / PC / arbitrary bytes
+
+-- Plugin editor windows (useful for debugging a headless session)
+daw.show_editor(track)   -- open native GUI for first VST on this track
+daw.close_editor(track)
+
+-- Remote eval (HTTP server on 127.0.0.1:8081)
+-- POST a Lua chunk to /eval, get the formatted result back:
+--   curl -d 'daw.bpm()' http://127.0.0.1:8081/eval
 
 -- Diagnostics
 daw.audio_info()
@@ -140,8 +156,8 @@ daw.load_script("scripts/clip_launcher.lua")
 ### Clip looping (fix attempted, needs audio verification)
 `daw.clip(t,s).launch()` now reads `MidiClip::getLoopLengthBeats()` first, falling back to `getEndBeat() - getStartBeat()` for freshly-inserted clips whose `loopLengthBeats` defaults to 0. Setting is gated on a non-zero duration. Verified to compile and run without crash; needs a JACK/PipeWire session to confirm audio actually loops.
 
-### VST3 plugins (e.g. Surge XT)
-`daw.load_plugin(track, path)` now registers the scanned `PluginDescription` with `PluginManager::knownPluginList` before inserting. Without that, Tracktion's `ExternalPlugin::findMatchingPlugin()` can't resolve the description during graph init and `doFullInitialisation()` silently bails — which is why `getLoadError()` returned the generic message and no audio came out. Needs a real VST3 file to verify end-to-end.
+### VST3 plugins (e.g. Surge XT) — verified
+`daw.load_plugin(track, path)` registers the scanned `PluginDescription` with `PluginManager::knownPluginList` before inserting. Without that, Tracktion's `ExternalPlugin::findMatchingPlugin()` can't resolve the description during graph init and `doFullInitialisation()` silently bails. Verified end-to-end with Surge XT on Linux (JACK/PipeWire) — `daw.show_editor(track)` opens the native GUI, `daw.note_on` drives the synth. Required bumping JUCE to pull in the Linux VST XEmbed/wrapper-window fixes.
 
 ### Shutdown
 Ctrl+C now exits cleanly via JUCE's built-in SIGINT handler (which posts a quit through the message loop and triggers `Engine::~Engine()`). Earlier versions of this code may have raced; the current shutdown ordering (REPL → Python → MIDI → Edit → Engine) cleans up correctly.
@@ -159,10 +175,9 @@ Ctrl+C now exits cleanly via JUCE's built-in SIGINT handler (which posts a quit 
 
 ## Planned
 
-- Phase 7: HTTP/WebSocket server for browser-based control
-- Clip looping fix
-- VST3 plugin loading fix
-- MIDI output routing
+- Phase 7 continued: WebSocket transport (the HTTP `/eval` endpoint is in)
+- Plugin editor support for Tracktion built-ins (currently `show_editor` is VST-only)
+- Clip looping fix — verify
 
 ## License
 
