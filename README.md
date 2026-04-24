@@ -137,31 +137,14 @@ daw.load_script("scripts/clip_launcher.lua")
 
 ## Known Issues
 
-### Clip looping
-`daw.clip(t,s).launch()` plays the clip once and stops. `LaunchHandle::setLooping()` is called with the clip's beat span (`getEndBeat() - getStartBeat()`) but clips still don't loop continuously.
-
-**Root cause:** Not yet identified. Likely in how session-view clips interact with Tracktion's playback graph loop rendering. The clip's beat span may differ from the sequence content length in ClipSlot context.
-
-**Next steps to investigate:**
-- Print the beat span value at launch time to verify it's non-zero
-- Check if `MidiClip::getLoopLengthBeats()` is a better source
-- Try calling `lh->setLooping({})` with `std::nullopt` to see if Tracktion has a default loop mode
-- Look at how Tracktion's own clip launcher examples handle looping
+### Clip looping (fix attempted, needs audio verification)
+`daw.clip(t,s).launch()` now reads `MidiClip::getLoopLengthBeats()` first, falling back to `getEndBeat() - getStartBeat()` for freshly-inserted clips whose `loopLengthBeats` defaults to 0. Setting is gated on a non-zero duration. Verified to compile and run without crash; needs a JACK/PipeWire session to confirm audio actually loops.
 
 ### VST3 plugins (e.g. Surge XT)
-`daw.load_plugin(track, path)` successfully scans the VST3 (`findAllTypesForFile` returns correct description with `instrument=1`), but `ExternalPlugin::getLoadError()` returns the generic "couldn't be loaded" error and the plugin produces no audio.
+`daw.load_plugin(track, path)` now registers the scanned `PluginDescription` with `PluginManager::knownPluginList` before inserting. Without that, Tracktion's `ExternalPlugin::findMatchingPlugin()` can't resolve the description during graph init and `doFullInitialisation()` silently bails — which is why `getLoadError()` returned the generic message and no audio came out. Needs a real VST3 file to verify end-to-end.
 
-`daw.load_4osc(track)` with Tracktion's built-in 4OSC synth **does** work and produces audio.
-
-**Root cause hypothesis:** `ExternalPlugin::initialiseFully()` isn't being triggered through the normal playback graph init when a plugin is inserted, and calling it directly from the message thread may conflict with the VST3 plugin's own threading requirements.
-
-**Next steps to investigate:**
-- Load the plugin *before* calling `daw.play()` — forces graph init to include the new plugin
-- Check whether `engine.getPluginManager().initialise()` is required first to register VST3 format handlers
-- Inspect the actual JUCE error from `AudioPluginFormatManager::createPluginInstance`
-
-### Shutdown segfault
-Ctrl+C causes a segfault due to a race between audio device teardown and Lua/Python thread cleanup. Use `quit` at the REPL instead.
+### Shutdown
+Ctrl+C now exits cleanly via JUCE's built-in SIGINT handler (which posts a quit through the message loop and triggers `Engine::~Engine()`). Earlier versions of this code may have raced; the current shutdown ordering (REPL → Python → MIDI → Edit → Engine) cleans up correctly.
 
 ## Phases Completed
 

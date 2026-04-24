@@ -572,8 +572,14 @@ static void registerDawApi (sol::state& lua,
                 if (auto* c = sl[slotIdx - 1]->getClip())
                     if (auto lh = c->getLaunchHandle())
                     {
-                        auto loopBeats = c->getEndBeat() - c->getStartBeat();
-                        lh->setLooping (loopBeats);
+                        // Prefer the clip's own loop range; fall back to the
+                        // timeline length for freshly-inserted clips whose
+                        // loopLengthBeats defaults to 0.
+                        auto loopBeats = c->getLoopLengthBeats();
+                        if (loopBeats <= te::BeatDuration{})
+                            loopBeats = c->getEndBeat() - c->getStartBeat();
+                        if (loopBeats > te::BeatDuration{})
+                            lh->setLooping (loopBeats);
                         lh->play (getLaunchPosition (edit));
                     }
             });
@@ -708,6 +714,14 @@ static void registerDawApi (sol::state& lua,
                           << "  fmt=" << d->pluginFormatName
                           << "  instrument=" << (int)d->isInstrument
                           << "  uid=" << d->uniqueId << "\n";
+
+            // Tracktion's ExternalPlugin::findMatchingPlugin() searches
+            // PluginManager::knownPluginList for a description matching the
+            // inserted plugin — if it's not registered there, doFullInitialisation
+            // silently bails and the plugin never loads. Register now so the
+            // graph-build init path can resolve it.
+            auto& pm = a->edit->engine.getPluginManager();
+            pm.knownPluginList.addType (*results[0]);
 
             auto vt = te::ExternalPlugin::create (a->edit->engine, *results[0]);
             at->pluginList.insertPlugin (vt, 0);
@@ -945,6 +959,12 @@ private:
 
             int ready = ::select (STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
 
+            // select() returns -1 with EINTR when a signal arrives (e.g.
+            // SIGINT); just loop — JUCE's installed SIGINT handler will
+            // request app quit on its next event-loop iteration.
+            if (ready < 0 && errno == EINTR)
+                continue;
+
             if (ready > 0)
             {
                 if (!std::getline (std::cin, line))
@@ -1070,6 +1090,7 @@ public:
         engine = std::make_unique<te::Engine> ("trakdaw",
                                                std::make_unique<te::UIBehaviour>(),
                                                std::make_unique<TrakdawBehaviour>());
+
         // 2. Devices
         auto& dm = engine->getDeviceManager();
         dm.initialise (0, 2);
