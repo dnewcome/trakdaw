@@ -193,9 +193,49 @@ clip.commit()
 - Output: Lua-defined "drunk walk" through clip grid — each clip randomly picks a neighbor
 
 ### Phase 7 — Developer UX
-- HTTP server in the app: POST `/eval` to run a script chunk
-- WebSocket: subscribe to DAW events (clip started, beat tick, MIDI in)
+- HTTP server in the app: POST `/eval` to run a script chunk — **shipped**
+- Server-Sent Events: `GET /events` streams JSON emitted by scripts via `daw.emit(name, table)` — **shipped**
+- WebSocket eval transport — **deferred** (see Control Surface Design below)
 - Optional: embed a code editor (Monaco via WebView, or just lean on external editors + the HTTP API)
+
+---
+
+## Control Surface Design (2026-04-24)
+
+### Goal
+External tools — a browser page, a TUI, a Python notebook — should be able to:
+1. Drive the running instance (send Lua, read back results)
+2. Observe what's happening (visualize the "effective state" the scripts are producing)
+
+Explicit **non-goal**: don't rebuild a traditional DAW editor. Clicking notes on a piano roll belongs in Ableton. trakdaw's value is that scripts are the primary authoring mechanism, and visualizations should reflect what the scripts did.
+
+### Decision
+Two channels, script-driven on both ends:
+
+- **Commands:** `POST /eval` (already shipped). Clients send Lua source, get the formatted result back. Same power as the stdin REPL.
+- **Events:** `GET /events` (SSE). Scripts opt into publishing via `daw.emit(name, table)`. Each subscriber gets a `data: {json}\n\n` frame per emit.
+
+No server-side state schema. If a visualizer wants to know "what clips are playing," it either evals a Lua snippet that asks, or subscribes to events the script chose to publish. The script is authoritative about what's interesting.
+
+### Why not a typed state API (`daw.snapshot()` returning a fixed struct)?
+The premise of the project is that scripts define behavior the engine doesn't know about — custom follow actions, drunk-walk sequencers, generative clips, `daw.store` keys invented on the fly. Any frozen schema would either under-report (miss script-defined state) or over-report (dump engine internals nobody asked for). Lua-as-query inherits exactly the dynamism of the script layer.
+
+### Why SSE and not WebSocket?
+- No new dependency (cpp-httplib already vendored, and cpp-httplib supports SSE via `set_chunked_content_provider`; WebSocket would require uWebSockets or similar).
+- Browser-native via `new EventSource(...)`; auto-reconnect included.
+- One-way (server → client) is enough: commands use `POST /eval`; clients don't need bidirectional on one socket.
+- Tradeoff: two TCP connections per client (one for POST, one for the event stream). Acceptable.
+
+If persistent eval or bidirectional push shows up as a real pain point, promote the event channel to WebSocket later — the `daw.emit` API won't change.
+
+### What's deliberately left out of v1
+- **Auth / access control.** The server binds `127.0.0.1` only; anyone with shell access on the host can already eval. Before exposing to a network, add a token header and a `daw_ro` read-only sandbox.
+- **Replay / history.** Events are fire-and-forget. A late subscriber doesn't see past events. Most visualizations tolerate this; if some don't, add a ring buffer keyed by topic.
+- **Backpressure semantics.** If a client is slow, the broker drops events past a 1024-deep per-subscriber queue rather than blocking the emitter. Scripts won't stall because a browser tab froze.
+- **Typed snapshots.** See above — deferred indefinitely.
+
+### Migration plan if Lua-as-query becomes painful
+Add structured helpers *alongside* eval, not instead of it. E.g. `GET /clips` returning a JSON view of the clip grid could be a thin wrapper over a canonical Lua query. Visualizers pick whichever is more convenient.
 
 ---
 

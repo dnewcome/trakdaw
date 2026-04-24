@@ -21,7 +21,11 @@ namespace py = pybind11;
 
 #include <sys/select.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
 #include <future>
 #include <map>
 #include <mutex>
@@ -425,6 +429,169 @@ static void dispatchMidiToLua (sol::state& lua, const MidiEvent& e)
 }
 
 //==============================================================================
+// EventBroker — fan-out of script-emitted events to SSE subscribers.
+// See PLAN.md ("Control surface design") for the design rationale:
+// scripts opt into broadcasting via daw.emit(name, table); external clients
+// subscribe via GET /events (Server-Sent Events) and render whatever they
+// like. Keeps the engine free of state-schema baggage.
+//==============================================================================
+class EventBroker
+{
+public:
+    struct Subscriber
+    {
+        std::mutex              mu;
+        std::condition_variable cv;
+        std::deque<std::string> queue;
+        bool                    disconnected = false;
+        static constexpr size_t kMaxQueue    = 1024;
+    };
+
+    std::shared_ptr<Subscriber> subscribe()
+    {
+        auto s = std::make_shared<Subscriber>();
+        std::lock_guard<std::mutex> lock (mu);
+        subs.push_back (s);
+        return s;
+    }
+
+    void emit (std::string data)
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        subs.erase (std::remove_if (subs.begin(), subs.end(),
+                                    [](auto& w) { return w.expired(); }),
+                    subs.end());
+        for (auto& w : subs)
+        {
+            if (auto s = w.lock())
+            {
+                std::lock_guard<std::mutex> sl (s->mu);
+                if (s->queue.size() < Subscriber::kMaxQueue)
+                    s->queue.push_back (data);
+                // drop on slow clients rather than OOM
+                s->cv.notify_one();
+            }
+        }
+    }
+
+    void shutdown()
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        for (auto& w : subs)
+            if (auto s = w.lock())
+            {
+                std::lock_guard<std::mutex> sl (s->mu);
+                s->disconnected = true;
+                s->cv.notify_all();
+            }
+    }
+
+private:
+    std::mutex                              mu;
+    std::vector<std::weak_ptr<Subscriber>>  subs;
+};
+
+//==============================================================================
+// Minimal Lua-to-JSON serializer. Only what daw.emit needs: nil/bool/number/
+// string/table. Tables are arrays iff all keys are integers 1..N with no gaps.
+//==============================================================================
+static void luaToJson (std::ostringstream& out, sol::object obj, int depth = 0)
+{
+    if (depth > 16) { out << "null"; return; }
+    switch (obj.get_type())
+    {
+        case sol::type::nil:     out << "null"; break;
+        case sol::type::boolean: out << (obj.as<bool>() ? "true" : "false"); break;
+        case sol::type::number:
+        {
+            double d = obj.as<double>();
+            if (std::isfinite (d)) out << d;
+            else                   out << "null";
+            break;
+        }
+        case sol::type::string:
+        {
+            out << '"';
+            for (unsigned char c : obj.as<std::string>())
+            {
+                switch (c)
+                {
+                    case '"':  out << "\\\""; break;
+                    case '\\': out << "\\\\"; break;
+                    case '\n': out << "\\n";  break;
+                    case '\r': out << "\\r";  break;
+                    case '\t': out << "\\t";  break;
+                    default:
+                        if (c < 0x20)
+                        {
+                            char buf[8];
+                            std::snprintf (buf, sizeof buf, "\\u%04x", (unsigned) c);
+                            out << buf;
+                        }
+                        else
+                        {
+                            out << (char) c;
+                        }
+                }
+            }
+            out << '"';
+            break;
+        }
+        case sol::type::table:
+        {
+            sol::table t = obj.as<sol::table>();
+            int count = 0, maxIdx = 0;
+            bool isArray = true;
+            t.for_each ([&] (sol::object k, sol::object) {
+                ++count;
+                if (k.get_type() != sol::type::number) { isArray = false; return; }
+                double n = k.as<double>();
+                int    i = (int) n;
+                if ((double) i != n || i < 1) { isArray = false; return; }
+                if (i > maxIdx) maxIdx = i;
+            });
+            if (isArray && maxIdx != count) isArray = false;
+
+            if (isArray)
+            {
+                out << '[';
+                for (int i = 1; i <= maxIdx; ++i)
+                {
+                    if (i > 1) out << ',';
+                    luaToJson (out, t[i], depth + 1);
+                }
+                out << ']';
+            }
+            else
+            {
+                out << '{';
+                bool first = true;
+                t.for_each ([&] (sol::object k, sol::object v) {
+                    if (! first) out << ',';
+                    first = false;
+                    std::string key;
+                    if (k.get_type() == sol::type::string)
+                        key = k.as<std::string>();
+                    else if (k.get_type() == sol::type::number)
+                        key = std::to_string (k.as<double>());
+                    out << '"';
+                    for (unsigned char c : key)
+                    {
+                        if (c == '"' || c == '\\') out << '\\';
+                        out << (char) c;
+                    }
+                    out << "\":";
+                    luaToJson (out, v, depth + 1);
+                });
+                out << '}';
+            }
+            break;
+        }
+        default: out << "null"; break;
+    }
+}
+
+//==============================================================================
 // PluginEditorWindow — hosts a juce::AudioProcessorEditor in a DocumentWindow
 // so VST plugin GUIs can be opened for debugging. Used by daw.show_editor.
 //==============================================================================
@@ -469,6 +636,7 @@ static void registerDawApi (sol::state& lua,
                              MidiEventQueue& midiQueue,
                              std::unique_ptr<juce::MidiOutput>& midiOutput,
                              PluginEditorMap& pluginEditors,
+                             EventBroker& eventBroker,
                              std::function<void(const std::string&)> onWatch,
                              PythonHost& pythonHost)
 {
@@ -843,6 +1011,35 @@ static void registerDawApi (sol::state& lua,
             midiOutput->sendMessageNow (juce::MidiMessage (bytes, size));
         });
 
+    // --- event broadcast (SSE via GET /events) ---
+
+    // daw.emit(name [, table])
+    // Broadcasts a JSON event to all connected SSE clients. Scripts choose
+    // what's worth publishing (clip launched, drunk-walk step, custom state).
+    // Visualizers subscribe and render whatever they want.
+    //
+    //   daw.emit("clip_launch", { track = 1, slot = 2 })
+    //   daw.emit("beat")
+    daw.set_function ("emit",
+        [&eventBroker](const std::string& name,
+                       sol::optional<sol::table> data) {
+            std::ostringstream out;
+            out << "{\"name\":\"";
+            for (unsigned char c : name)
+            {
+                if (c == '"' || c == '\\') out << '\\';
+                out << (char) c;
+            }
+            out << "\"";
+            if (data.has_value())
+            {
+                out << ",\"data\":";
+                luaToJson (out, data.value());
+            }
+            out << "}";
+            eventBroker.emit (out.str());
+        });
+
     // --- native Tracktion MIDI input routing ---
     // Unlike the raw juce::MidiInput path (MidiEventQueue → on_midi), this
     // uses Tracktion's DeviceManager so MIDI flows straight into a track's
@@ -1113,7 +1310,8 @@ static void registerDawApi (sol::state& lua,
 class LuaRepl : private juce::Thread
 {
 public:
-    LuaRepl (te::Edit& edit, MidiEventQueue& midiQueue, PythonHost& pythonHost)
+    LuaRepl (te::Edit& edit, MidiEventQueue& midiQueue,
+             EventBroker& eventBroker, PythonHost& pythonHost)
         : juce::Thread ("lua-repl"), edit (edit), midiQueue (midiQueue)
     {
         lua.open_libraries (sol::lib::base, sol::lib::string,
@@ -1121,6 +1319,7 @@ public:
                             sol::lib::io,     sol::lib::os);
 
         registerDawApi (lua, edit, midiQueue, midiOutput, pluginEditors,
+            eventBroker,
             [this](const std::string& path) {
                 watch.path  = path;
                 watch.mtime = juce::File (path).getLastModificationTime();
@@ -1491,14 +1690,15 @@ private:
 class HttpServer : private juce::Thread
 {
 public:
-    HttpServer (LuaRepl& repl, int port)
-        : juce::Thread ("http-server"), repl (repl), port (port) {}
+    HttpServer (LuaRepl& repl, EventBroker& broker, int port)
+        : juce::Thread ("http-server"), repl (repl), broker (broker), port (port) {}
 
     void start() { startThread(); }
 
     void shutdown()
     {
         signalThreadShouldExit();
+        broker.shutdown();   // wake SSE content providers so they return false
         svr.stop();          // unblocks listen()
         stopThread (2000);
     }
@@ -1522,12 +1722,54 @@ private:
             }
         });
 
+        // GET /events — Server-Sent Events stream.
+        // Clients subscribe with `new EventSource("http://127.0.0.1:8081/events")`
+        // in the browser, or `curl -N http://127.0.0.1:8081/events` on the CLI.
+        // Server emits `data: {json}\n\n` frames whenever a script calls
+        // daw.emit(). A `:heartbeat\n\n` comment is sent every 15s so proxies
+        // and load balancers don't drop the idle connection.
+        svr.Get ("/events", [this] (const httplib::Request&,
+                                    httplib::Response& res)
+        {
+            auto sub = broker.subscribe();
+            res.set_header ("Cache-Control", "no-cache");
+            res.set_chunked_content_provider ("text/event-stream",
+                [sub] (size_t, httplib::DataSink& sink) -> bool
+                {
+                    std::unique_lock<std::mutex> lk (sub->mu);
+                    sub->cv.wait_for (lk, std::chrono::seconds (15),
+                        [&]{ return ! sub->queue.empty() || sub->disconnected; });
+
+                    if (sub->disconnected) return false;
+
+                    if (sub->queue.empty())
+                    {
+                        lk.unlock();
+                        static const char hb[] = ":heartbeat\n\n";
+                        return sink.write (hb, sizeof hb - 1);
+                    }
+
+                    std::deque<std::string> local;
+                    std::swap (local, sub->queue);
+                    lk.unlock();
+
+                    for (auto& msg : local)
+                    {
+                        std::string frame = "data: " + msg + "\n\n";
+                        if (! sink.write (frame.data(), frame.size()))
+                            return false;
+                    }
+                    return true;
+                });
+        });
+
         std::cout << "[http] listening on http://127.0.0.1:" << port
-                  << "/eval\n" << std::flush;
+                  << "  (POST /eval, GET /events)\n" << std::flush;
         svr.listen ("127.0.0.1", port);
     }
 
     LuaRepl&         repl;
+    EventBroker&     broker;
     int              port;
     httplib::Server  svr;
 };
@@ -1690,12 +1932,15 @@ public:
         pythonHost->start();
         std::cout << "[trakdaw] Python host started\n";
 
-        // 7. Lua REPL
-        repl = std::make_unique<LuaRepl> (*edit, midiQueue, *pythonHost);
+        // 7. Event broker (shared between REPL and HTTP server)
+        eventBroker = std::make_unique<EventBroker>();
+
+        // 8. Lua REPL
+        repl = std::make_unique<LuaRepl> (*edit, midiQueue, *eventBroker, *pythonHost);
         repl->start();
 
-        // 8. HTTP server (POST /eval — runs Lua chunks remotely)
-        httpServer = std::make_unique<HttpServer> (*repl, 8081);
+        // 9. HTTP server (POST /eval, GET /events)
+        httpServer = std::make_unique<HttpServer> (*repl, *eventBroker, 8081);
         httpServer->start();
     }
 
@@ -1703,6 +1948,7 @@ public:
     {
         if (httpServer)  { httpServer->shutdown();  httpServer.reset(); }
         if (repl)        { repl->shutdown();        repl.reset(); }
+        eventBroker.reset();
         if (pythonHost)  { pythonHost->shutdown();  pythonHost.reset(); }
         g_pyEdit = nullptr;
 
@@ -1733,6 +1979,7 @@ private:
     std::unique_ptr<MidiInputHandler>             midiHandler;
     std::vector<std::unique_ptr<juce::MidiInput>> midiInputs;
     std::unique_ptr<PythonHost>                   pythonHost;
+    std::unique_ptr<EventBroker>                  eventBroker;
     std::unique_ptr<LuaRepl>                      repl;
     std::unique_ptr<HttpServer>                   httpServer;
 };

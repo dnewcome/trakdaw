@@ -98,9 +98,10 @@ daw.send_midi_raw(b1 [, b2 [, b3]])            -- CC / PC / arbitrary bytes
 daw.show_editor(track)   -- open native GUI for first VST on this track
 daw.close_editor(track)
 
--- Remote eval (HTTP server on 127.0.0.1:8081)
--- POST a Lua chunk to /eval, get the formatted result back:
---   curl -d 'daw.bpm()' http://127.0.0.1:8081/eval
+-- Remote eval + event stream (HTTP server on 127.0.0.1:8081)
+--   curl -d 'daw.bpm()' http://127.0.0.1:8081/eval       -- run Lua, get result
+--   curl -N http://127.0.0.1:8081/events                 -- subscribe to events
+daw.emit(name [, table])   -- broadcast JSON to all /events subscribers
 
 -- Diagnostics
 daw.audio_info()
