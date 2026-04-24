@@ -36,6 +36,8 @@ namespace py = pybind11;
 // collide with anything JUCE pulls in via X11/Cocoa headers.
 #include <httplib.h>
 
+#include "web_ui.h"
+
 namespace te = tracktion;
 using namespace tracktion::literals;
 
@@ -1706,6 +1708,11 @@ public:
 private:
     void run() override
     {
+        // GET / — built-in web UI (eval box + live event log)
+        svr.Get ("/", [] (const httplib::Request&, httplib::Response& res) {
+            res.set_content (kIndexHtml, "text/html; charset=utf-8");
+        });
+
         svr.Post ("/eval", [this] (const httplib::Request& req,
                                    httplib::Response& res)
         {
@@ -1764,7 +1771,7 @@ private:
         });
 
         std::cout << "[http] listening on http://127.0.0.1:" << port
-                  << "  (POST /eval, GET /events)\n" << std::flush;
+                  << "  (web UI at /, POST /eval, GET /events)\n" << std::flush;
         svr.listen ("127.0.0.1", port);
     }
 
