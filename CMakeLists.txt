@@ -50,7 +50,8 @@ endif()
 
 target_include_directories(trakdaw PRIVATE
     ${LUAJIT_INCLUDE_DIRS}
-    vendor/sol2/include)   # sol2 headers
+    vendor/sol2/include    # sol2 headers
+    vendor/cpp-httplib)    # cpp-httplib (HTTP server for /eval)
 
 target_compile_definitions(trakdaw PRIVATE
     JUCE_PLUGINHOST_VST3=1
