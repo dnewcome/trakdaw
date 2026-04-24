@@ -833,7 +833,7 @@ static void registerDawApi (sol::state& lua,
             juce::ValueTree vt (te::IDs::PLUGIN);
             vt.setProperty (te::IDs::type, te::FourOscPlugin::xmlTypeName, nullptr);
             at->pluginList.insertPlugin (vt, 0);
-            a->edit->restartPlayback();   // see load_plugin for rationale
+            a->edit->getTransport().ensureContextAllocated (true);   // see load_plugin for rationale
             a->ok = true;
             return nullptr;
         }, &args);
@@ -1491,7 +1491,14 @@ static void registerDawApi (sol::state& lua,
             // stop/play dance was a no-op when the transport wasn't already
             // playing, which left the audio graph without the new plugin
             // and made daw.note_on silent.
-            a->edit->restartPlayback();
+            // Force a full audio-graph rebuild. restartPlayback() alone
+            // no-ops when transport has never started (because it routes
+            // through editHasChanged(), which bails if playbackContext is
+            // null). ensureContextAllocated(true) both creates the context
+            // and forces a node reallocation that includes the just-
+            // inserted plugin — so injectLiveMidiMessage reaches it even
+            // before the user presses play.
+            a->edit->getTransport().ensureContextAllocated (true);
             a->name   = results[0]->name.toStdString();
             a->format = results[0]->pluginFormatName.toStdString();
             a->ok = true;
