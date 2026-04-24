@@ -843,6 +843,116 @@ static void registerDawApi (sol::state& lua,
             midiOutput->sendMessageNow (juce::MidiMessage (bytes, size));
         });
 
+    // --- native Tracktion MIDI input routing ---
+    // Unlike the raw juce::MidiInput path (MidiEventQueue → on_midi), this
+    // uses Tracktion's DeviceManager so MIDI flows straight into a track's
+    // plugin chain with no Lua callback. Both paths can run in parallel;
+    // expect duplicate delivery if a script routes the same physical device
+    // through both.
+
+    // daw.list_engine_midi_inputs() — Tracktion's view of MIDI input devices
+    daw.set_function ("list_engine_midi_inputs", [&edit]() {
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void* ctx) -> void* {
+                auto& e = *static_cast<te::Edit*> (ctx);
+                for (auto& dev : e.engine.getDeviceManager().getMidiInDevices())
+                    std::cout << "  " << dev->getName().toStdString()
+                              << (dev->isEnabled() ? "  [enabled]" : "") << "\n";
+                return nullptr;
+            }, &edit);
+    });
+
+    // daw.assign_midi_input(deviceName, trackIdx)
+    // Enables the named Tracktion MidiInputDevice and routes it to the
+    // given track (1-based). Returns true on success.
+    daw.set_function ("assign_midi_input",
+        [&edit](const std::string& name, int trackIdx) -> bool {
+            struct Args { te::Edit* edit; std::string name; int idx;
+                          bool ok; std::string err; };
+            Args args { &edit, name, trackIdx, false, {} };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto  tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size())
+                        { a->err = "track index out of range"; return nullptr; }
+                    auto* track = tracks[a->idx - 1];
+
+                    std::shared_ptr<te::MidiInputDevice> device;
+                    for (auto& d : a->edit->engine.getDeviceManager().getMidiInDevices())
+                        if (d->getName().containsIgnoreCase (juce::String (a->name)))
+                            { device = d; break; }
+                    if (! device)
+                        { a->err = "no matching MIDI input device"; return nullptr; }
+
+                    device->setEnabled (true);
+                    a->edit->getTransport().ensureContextAllocated();
+                    auto* ctxPlay = a->edit->getCurrentPlaybackContext();
+                    if (! ctxPlay)
+                        { a->err = "no playback context"; return nullptr; }
+                    auto* inst = ctxPlay->getInputFor (device.get());
+                    if (! inst)
+                        { a->err = "no input instance for device"; return nullptr; }
+
+                    auto result = inst->setTarget (track->itemID, false, nullptr);
+                    if (! result)
+                        { a->err = result.error().toStdString(); return nullptr; }
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            if (args.ok)
+                std::cout << "[midi-in] " << name << " → track " << trackIdx
+                          << "\n> " << std::flush;
+            else
+                std::cerr << "[assign_midi_input error] " << args.err
+                          << "\n> " << std::flush;
+            return args.ok;
+        });
+
+    // daw.unassign_midi_input(deviceName, trackIdx)
+    daw.set_function ("unassign_midi_input",
+        [&edit](const std::string& name, int trackIdx) -> bool {
+            struct Args { te::Edit* edit; std::string name; int idx;
+                          bool ok; std::string err; };
+            Args args { &edit, name, trackIdx, false, {} };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto  tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size())
+                        { a->err = "track index out of range"; return nullptr; }
+                    auto* track = tracks[a->idx - 1];
+
+                    std::shared_ptr<te::MidiInputDevice> device;
+                    for (auto& d : a->edit->engine.getDeviceManager().getMidiInDevices())
+                        if (d->getName().containsIgnoreCase (juce::String (a->name)))
+                            { device = d; break; }
+                    if (! device)
+                        { a->err = "no matching MIDI input device"; return nullptr; }
+
+                    auto* ctxPlay = a->edit->getCurrentPlaybackContext();
+                    if (! ctxPlay)
+                        { a->err = "no playback context"; return nullptr; }
+                    auto* inst = ctxPlay->getInputFor (device.get());
+                    if (! inst)
+                        { a->err = "no input instance for device"; return nullptr; }
+
+                    auto r = inst->removeTarget (track->itemID, nullptr);
+                    if (r.failed())
+                        { a->err = r.getErrorMessage().toStdString(); return nullptr; }
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            if (! args.ok)
+                std::cerr << "[unassign_midi_input error] " << args.err
+                          << "\n> " << std::flush;
+            return args.ok;
+        });
+
     // --- scripting ---
 
     // daw.load_script(path) — execute a Lua file and start watching it for changes
