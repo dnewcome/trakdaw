@@ -833,6 +833,7 @@ static void registerDawApi (sol::state& lua,
             juce::ValueTree vt (te::IDs::PLUGIN);
             vt.setProperty (te::IDs::type, te::FourOscPlugin::xmlTypeName, nullptr);
             at->pluginList.insertPlugin (vt, 0);
+            a->edit->restartPlayback();   // see load_plugin for rationale
             a->ok = true;
             return nullptr;
         }, &args);
@@ -1485,12 +1486,12 @@ static void registerDawApi (sol::state& lua,
 
             auto vt = te::ExternalPlugin::create (a->edit->engine, *results[0]);
             at->pluginList.insertPlugin (vt, 0);
-            // Restart playback so Tracktion rebuilds the audio graph and initialises
-            // the new plugin through the normal render path.
-            bool wasPlaying = a->edit->getTransport().isPlaying();
-            a->edit->getTransport().stop (false, false);
-            if (wasPlaying)
-                a->edit->getTransport().play (false);
+            // Force a graph rebuild so injectLiveMidiMessage actually reaches
+            // the new plugin even when the transport is stopped. The older
+            // stop/play dance was a no-op when the transport wasn't already
+            // playing, which left the audio graph without the new plugin
+            // and made daw.note_on silent.
+            a->edit->restartPlayback();
             a->name   = results[0]->name.toStdString();
             a->format = results[0]->pluginFormatName.toStdString();
             a->ok = true;
@@ -1825,21 +1826,37 @@ private:
 
             if (ready > 0)
             {
-                if (!std::getline (std::cin, line))
-                    break;
-
-                if (line == "quit" || line == "exit")
+                // Drain every buffered line, not just one. When a user
+                // pastes a block, std::cin slurps it into its internal
+                // iostream buffer and select() on the fd goes quiet —
+                // subsequent lines would sit there for up to the next
+                // select timeout without `in_avail()` catching them.
+                bool shouldExit = false;
+                do
                 {
-                    juce::MessageManager::callAsync ([] {
-                        juce::JUCEApplicationBase::getInstance()->quit();
-                    });
-                    break;
+                    if (! std::getline (std::cin, line))
+                    {
+                        shouldExit = true;
+                        break;
+                    }
+
+                    if (line == "quit" || line == "exit")
+                    {
+                        juce::MessageManager::callAsync ([] {
+                            juce::JUCEApplicationBase::getInstance()->quit();
+                        });
+                        shouldExit = true;
+                        break;
+                    }
+
+                    if (! line.empty())
+                        evalLine (line);
+
+                    std::cout << "> " << std::flush;
                 }
+                while (std::cin.rdbuf()->in_avail() > 0);
 
-                if (!line.empty())
-                    evalLine (line);
-
-                std::cout << "> " << std::flush;
+                if (shouldExit) break;
             }
 
             drainMidi();
