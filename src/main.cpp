@@ -36,6 +36,9 @@ namespace py = pybind11;
 // collide with anything JUCE pulls in via X11/Cocoa headers.
 #include <httplib.h>
 
+#include <readline/readline.h>
+#include <readline/history.h>
+
 #include "web_ui.h"
 
 namespace te = tracktion;
@@ -358,11 +361,11 @@ if hasattr(sys.stderr, 'buffer'):
             {
                 py::eval_file (path);
                 py::exec ("import sys; sys.stdout.flush(); sys.stderr.flush()");
-                std::cout << "[python] done: " << path << "\n> " << std::flush;
+                std::cout << "[python] done: " << path << "\n" << std::flush;
             }
             catch (py::error_already_set& e)
             {
-                std::cerr << "[python error] " << e.what() << "\n> " << std::flush;
+                std::cerr << "[python error] " << e.what() << "\n" << std::flush;
             }
         }
 
@@ -513,7 +516,7 @@ static void dispatchMidiToLua (sol::state& lua, const MidiEvent& e,
     if (!result.valid())
     {
         sol::error err = result;
-        std::cerr << "\n[on_midi error] " << err.what() << "\n> " << std::flush;
+        std::cerr << "\n[on_midi error] " << err.what() << "\n" << std::flush;
     }
 }
 
@@ -737,7 +740,7 @@ public:
             {
                 sol::error err = result;
                 std::cerr << "\n[scheduler error] " << err.what()
-                          << "\n> " << std::flush;
+                          << "\n" << std::flush;
                 continue;
             }
             if (result.return_count() > 0)
@@ -876,7 +879,7 @@ static void registerDawApi (sol::state& lua,
         }, &args);
         if (args.ok)
         {
-            std::cout << "[4osc] loaded on track " << trackIdx << "\n> " << std::flush;
+            std::cout << "[4osc] loaded on track " << trackIdx << "\n" << std::flush;
             std::ostringstream o;
             o << "{\"track\":" << trackIdx
               << ",\"name\":\"4osc\",\"format\":\"tracktion\",\"ok\":true}";
@@ -961,10 +964,10 @@ static void registerDawApi (sol::state& lua,
 
             if (args.ok)
                 std::cout << "[show_editor] opened for track " << trackIdx
-                          << "\n> " << std::flush;
+                          << "\n" << std::flush;
             else
                 std::cerr << "[show_editor error] " << args.err
-                          << "\n> " << std::flush;
+                          << "\n" << std::flush;
             {
                 std::ostringstream o;
                 o << "{\"track\":" << trackIdx
@@ -1002,9 +1005,9 @@ static void registerDawApi (sol::state& lua,
         setup.outputChannels.setRange (0, 2, true);
         auto err = adm.setAudioDeviceSetup (setup, true);
         if (err.isEmpty())
-            std::cout << "[audio] opened: " << name << "\n> " << std::flush;
+            std::cout << "[audio] opened: " << name << "\n" << std::flush;
         else
-            std::cout << "[audio error] " << err << "\n> " << std::flush;
+            std::cout << "[audio error] " << err << "\n" << std::flush;
         std::ostringstream o;
         o << "{\"name\":\"" << name << "\",\"ok\":" << (err.isEmpty() ? "true" : "false");
         if (! err.isEmpty()) o << ",\"error\":\"" << err.toStdString() << "\"";
@@ -1362,10 +1365,10 @@ static void registerDawApi (sol::state& lua,
 
             if (args.ok)
                 std::cout << "[midi-in] " << name << " → track " << trackIdx
-                          << "\n> " << std::flush;
+                          << "\n" << std::flush;
             else
                 std::cerr << "[assign_midi_input error] " << args.err
-                          << "\n> " << std::flush;
+                          << "\n" << std::flush;
             {
                 std::ostringstream o;
                 o << "{\"device\":\"" << name << "\""
@@ -1416,7 +1419,7 @@ static void registerDawApi (sol::state& lua,
 
             if (! args.ok)
                 std::cerr << "[unassign_midi_input error] " << args.err
-                          << "\n> " << std::flush;
+                          << "\n" << std::flush;
             {
                 std::ostringstream o;
                 o << "{\"device\":\"" << name << "\""
@@ -1562,9 +1565,9 @@ static void registerDawApi (sol::state& lua,
         emitAuto (eventBroker, "plugin_load", o.str());
 
         if (args.ok)
-            std::cout << "[load_plugin] loaded on track " << trackIdx << "\n> " << std::flush;
+            std::cout << "[load_plugin] loaded on track " << trackIdx << "\n" << std::flush;
         else
-            std::cerr << "[load_plugin error] " << args.err << "\n> " << std::flush;
+            std::cerr << "[load_plugin error] " << args.err << "\n" << std::flush;
         return args.ok;
     });
 
@@ -1618,9 +1621,9 @@ static void registerDawApi (sol::state& lua,
 
             if (args.ok)
                 std::cout << "[save_patch] " << args.count
-                          << " plugin(s) → " << path << "\n> " << std::flush;
+                          << " plugin(s) → " << path << "\n" << std::flush;
             else
-                std::cerr << "[save_patch error] " << args.err << "\n> " << std::flush;
+                std::cerr << "[save_patch error] " << args.err << "\n" << std::flush;
             return args.ok;
         });
 
@@ -1682,9 +1685,9 @@ static void registerDawApi (sol::state& lua,
 
             if (args.ok)
                 std::cout << "[load_patch] " << args.count
-                          << " plugin(s) ← " << path << "\n> " << std::flush;
+                          << " plugin(s) ← " << path << "\n" << std::flush;
             else
-                std::cerr << "[load_patch error] " << args.err << "\n> " << std::flush;
+                std::cerr << "[load_patch error] " << args.err << "\n" << std::flush;
             return args.ok;
         });
 
@@ -1784,7 +1787,7 @@ static void registerDawApi (sol::state& lua,
                     return nullptr;
                 }, &args);
             if (! args.ok)
-                std::cerr << "[set_param error] " << args.err << "\n> " << std::flush;
+                std::cerr << "[set_param error] " << args.err << "\n" << std::flush;
             return args.ok;
         });
 
@@ -1826,10 +1829,24 @@ static void registerDawApi (sol::state& lua,
         if (!result.valid())
         {
             sol::error err = result;
-            std::cerr << "\n[trigger_follow error] " << err.what() << "\n> " << std::flush;
+            std::cerr << "\n[trigger_follow error] " << err.what() << "\n" << std::flush;
         }
     });
 }
+
+// readline's callback API requires C-style free functions, so we set this
+// to point at the live LuaRepl just before installing the handler.
+class LuaRepl;
+static LuaRepl* s_replForReadline = nullptr;
+
+static juce::String readlineHistoryPath()
+{
+    return juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+                .getChildFile (".trakdaw_history").getFullPathName();
+}
+
+// readline calls this when a complete line is ready. line == nullptr means EOF.
+static void readlineLineCallback (char* line);  // forward; defined after LuaRepl
 
 //==============================================================================
 // LuaRepl
@@ -1853,7 +1870,7 @@ public:
                 watch.mtime = juce::File (path).getLastModificationTime();
                 watch.pending = false;
                 std::cout << "[watch] monitoring: "
-                          << juce::File (path).getFileName() << "\n> " << std::flush;
+                          << juce::File (path).getFileName() << "\n" << std::flush;
             },
             pythonHost);
     }
@@ -1870,6 +1887,33 @@ public:
                 static_cast<PluginEditorMap*> (ctx)->clear();
                 return nullptr;
             }, &pluginEditors);
+    }
+
+    // Called from the readline line-completion callback (which is a C-style
+    // free function and can't reach private members directly).
+    void onReplLine (const std::string& line)
+    {
+        if (line == "quit" || line == "exit")
+        {
+            juce::MessageManager::callAsync ([] {
+                juce::JUCEApplicationBase::getInstance()->quit();
+            });
+            replShouldExit = true;
+            return;
+        }
+        if (! line.empty())
+        {
+            add_history (line.c_str());
+            evalLine (line);
+        }
+    }
+
+    void onReplEof()    // Ctrl+D
+    {
+        juce::MessageManager::callAsync ([] {
+            juce::JUCEApplicationBase::getInstance()->quit();
+        });
+        replShouldExit = true;
     }
 
     // Queue a Lua chunk for execution on the REPL thread. Returns a future
@@ -2050,7 +2094,7 @@ private:
         if (result.valid())
         {
             std::cout << "[hot-reload] reloaded: "
-                      << juce::File (watch.path).getFileName() << "\n> " << std::flush;
+                      << juce::File (watch.path).getFileName() << "\n" << std::flush;
             std::ostringstream o;
             o << "{\"path\":\"" << watch.path << "\",\"trigger\":\"hot_reload\"}";
             emitAuto (eventBroker, "script_load", o.str());
@@ -2058,7 +2102,7 @@ private:
         else
         {
             sol::error err = result;
-            std::cout << "[hot-reload] error: " << err.what() << "\n> " << std::flush;
+            std::cout << "[hot-reload] error: " << err.what() << "\n" << std::flush;
         }
     }
 
@@ -2067,22 +2111,29 @@ private:
     // -----------------------------------------------------------------------
     void run() override
     {
-        std::cout << "\ntrakdaw Lua REPL (Phase 4 — hot reload)\n";
+        std::cout << "\ntrakdaw Lua REPL — readline + history (up arrow recalls)\n";
         std::cout << "  daw.play() / daw.stop()              transport\n";
         std::cout << "  daw.clip(t,s).launch()               launch clip (1-based)\n";
-        std::cout << "  daw.inject_midi(note, vel)           fake MIDI to on_midi callback\n";
         std::cout << "  daw.note_on(t, note, vel)            play instrument on track t\n";
-        std::cout << "  daw.note_off(t, note)                stop instrument note\n";
         std::cout << "  daw.load_script(\"path.lua\")          load + watch for changes\n";
         std::cout << "  daw.store.x = val                    persistent across reloads\n";
-        std::cout << "  function on_midi(m) ... end          MIDI callback\n";
-        std::cout << "  quit / exit\n\n";
+        std::cout << "  http://127.0.0.1:8081/               web UI\n";
+        std::cout << "  quit / exit / Ctrl+D\n\n";
 
-        std::cout << "> " << std::flush;
+        // readline takes over stdin: history + line editing + reverse search.
+        // Don't let it install signal handlers — JUCE's SIGINT handler should
+        // win so Ctrl+C quits the app cleanly.
+        rl_catch_signals = 0;
+        rl_catch_sigwinch = 0;
 
-        std::string line;
+        const auto histPath = readlineHistoryPath();
+        read_history (histPath.toRawUTF8());            // best-effort; fine if missing
+        stifle_history (1000);
 
-        while (!threadShouldExit())
+        s_replForReadline = this;
+        rl_callback_handler_install ("> ", &readlineLineCallback);
+
+        while (! threadShouldExit() && ! replShouldExit)
         {
             fd_set fds;
             FD_ZERO (&fds);
@@ -2091,45 +2142,19 @@ private:
 
             int ready = ::select (STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
 
-            // select() returns -1 with EINTR when a signal arrives (e.g.
-            // SIGINT); just loop — JUCE's installed SIGINT handler will
-            // request app quit on its next event-loop iteration.
             if (ready < 0 && errno == EINTR)
                 continue;
 
-            if (ready > 0)
+            // Feed every available byte to readline. Each call may complete
+            // a line and invoke our callback (which evaluates it). Pasted
+            // multi-line blocks fall out of this loop naturally — readline
+            // sees the whole buffer and fires the callback once per newline.
+            while (ready > 0)
             {
-                // Drain every buffered line, not just one. When a user
-                // pastes a block, std::cin slurps it into its internal
-                // iostream buffer and select() on the fd goes quiet —
-                // subsequent lines would sit there for up to the next
-                // select timeout without `in_avail()` catching them.
-                bool shouldExit = false;
-                do
-                {
-                    if (! std::getline (std::cin, line))
-                    {
-                        shouldExit = true;
-                        break;
-                    }
-
-                    if (line == "quit" || line == "exit")
-                    {
-                        juce::MessageManager::callAsync ([] {
-                            juce::JUCEApplicationBase::getInstance()->quit();
-                        });
-                        shouldExit = true;
-                        break;
-                    }
-
-                    if (! line.empty())
-                        evalLine (line);
-
-                    std::cout << "> " << std::flush;
-                }
-                while (std::cin.rdbuf()->in_avail() > 0);
-
-                if (shouldExit) break;
+                rl_callback_read_char();
+                FD_ZERO (&fds); FD_SET (STDIN_FILENO, &fds);
+                struct timeval zero { 0, 0 };
+                ready = ::select (STDIN_FILENO + 1, &fds, nullptr, nullptr, &zero);
             }
 
             drainMidi();
@@ -2139,6 +2164,10 @@ private:
             checkFollowActions();
             scheduler.tick();
         }
+
+        rl_callback_handler_remove();
+        write_history (histPath.toRawUTF8());
+        s_replForReadline = nullptr;
     }
 
     // -----------------------------------------------------------------------
@@ -2201,7 +2230,7 @@ private:
                 if (!result.valid())
                 {
                     sol::error err = result;
-                    std::cerr << "\n[on_end error] " << err.what() << "\n> " << std::flush;
+                    std::cerr << "\n[on_end error] " << err.what() << "\n" << std::flush;
                 }
 
                 std::ostringstream o;
@@ -2234,6 +2263,7 @@ private:
     EventBroker&                       eventBroker;
     sol::state                         lua;
     Scheduler                          scheduler;
+    bool                               replShouldExit = false;
     WatchState                         watch;
     std::unique_ptr<juce::MidiOutput>  midiOutput;
     PluginEditorMap                    pluginEditors;
@@ -2241,6 +2271,21 @@ private:
     std::mutex                         evalMutex;
     std::queue<EvalRequest>            evalQueue;
 };
+
+// Defined here (after LuaRepl is complete) because the callback dispatches
+// onto a LuaRepl method.
+static void readlineLineCallback (char* line)
+{
+    if (s_replForReadline == nullptr) { if (line) free (line); return; }
+    if (line == nullptr)
+    {
+        s_replForReadline->onReplEof();
+        return;
+    }
+    std::string s (line);
+    free (line);
+    s_replForReadline->onReplLine (s);
+}
 
 //==============================================================================
 // HttpServer — exposes POST /eval which runs a Lua chunk on the REPL thread

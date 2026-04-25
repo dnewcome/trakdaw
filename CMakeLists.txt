@@ -83,3 +83,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_include_directories(trakdaw PRIVATE ${JACK_INCLUDE_DIRS})
     target_link_libraries(trakdaw PRIVATE "-latomic" ${JACK_LIBRARIES})
 endif()
+
+# GNU readline for the stdin REPL (history, line editing, reverse search).
+# POSIX-only for now; Windows portability tracked in #1.
+if(NOT WIN32)
+    find_path(READLINE_INCLUDE_DIR readline/readline.h REQUIRED)
+    find_library(READLINE_LIBRARY readline REQUIRED)
+    target_include_directories(trakdaw PRIVATE ${READLINE_INCLUDE_DIR})
+    target_link_libraries(trakdaw PRIVATE ${READLINE_LIBRARY})
+endif()
