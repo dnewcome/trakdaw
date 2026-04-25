@@ -76,6 +76,9 @@ daw.load_4osc(track)                          -- Tracktion built-in synth (works
 daw.load_plugin(track, "/path/to/foo.vst3")   -- external VST3 (see known issues)
 daw.save_patch(track, "patches/my.xml")       -- save full plugin chain on track
 daw.load_patch(track, "patches/my.xml")       -- restore plugin chain (replaces existing)
+daw.list_params(track [, max=50])             -- print id, name, value, range
+daw.get_param(track, "filter1.cutoff")        -- → number, or nil if not found
+daw.set_param(track, "filter1.cutoff", 0.7)   -- → bool
 
 -- Scripts
 daw.load_script("scripts/foo.lua")   -- load + watch for hot reload

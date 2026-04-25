@@ -764,6 +764,21 @@ private:
     int                        nextId = 0;
 };
 
+// Look up the first plugin's automatable parameter on an AudioTrack by ID,
+// falling back to a case-insensitive match on the display name.
+static te::AutomatableParameter*
+findFirstPluginParam (te::AudioTrack* at, const std::string& name)
+{
+    if (at == nullptr || at->pluginList.size() == 0) return nullptr;
+    auto* plug = at->pluginList[0];
+    const juce::String n (name);
+    for (auto* p : plug->getAutomatableParameters())
+        if (p->paramID == n) return p;
+    for (auto* p : plug->getAutomatableParameters())
+        if (p->getParameterName().equalsIgnoreCase (n)) return p;
+    return nullptr;
+}
+
 //==============================================================================
 // Register the `daw` table.
 // onWatch(path) is called when load_script succeeds — lets LuaRepl set up watching.
@@ -1639,6 +1654,91 @@ static void registerDawApi (sol::state& lua,
                           << " plugin(s) ← " << path << "\n> " << std::flush;
             else
                 std::cerr << "[load_patch error] " << args.err << "\n> " << std::flush;
+            return args.ok;
+        });
+
+    // --- plugin parameters ---
+    //
+    // Lookup is by paramID first (e.g. "filter1.cutoff"), falling back to
+    // case-insensitive match on the display name. Operates on the first
+    // plugin in the track's chain. (See findFirstPluginParam above.)
+
+    // daw.list_params(track [, max=50]) — prints id, name, current, range
+    daw.set_function ("list_params",
+        [&edit](int trackIdx, sol::optional<int> maxOpt) {
+            struct Args { te::Edit* edit; int idx; int max; };
+            Args args { &edit, trackIdx, maxOpt.value_or (50) };
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size())
+                        { std::cout << "(track not found)\n"; return nullptr; }
+                    auto* at = tracks[a->idx - 1];
+                    if (at->pluginList.size() == 0)
+                        { std::cout << "(no plugin on track)\n"; return nullptr; }
+                    auto* plug = at->pluginList[0];
+                    auto params = plug->getAutomatableParameters();
+                    int total = params.size();
+                    int shown = std::min (total, a->max);
+                    std::cout << "Track " << a->idx << " — "
+                              << plug->getName().toStdString()
+                              << " — " << total << " params"
+                              << (shown < total ? " (showing first " + std::to_string(shown) + ")" : "")
+                              << "\n";
+                    for (int i = 0; i < shown; ++i)
+                    {
+                        auto* p = params[i];
+                        auto r = p->getValueRange();
+                        std::cout << "  " << p->paramID.toStdString()
+                                  << "  (" << p->getParameterName().toStdString() << ")"
+                                  << "  cur=" << p->getCurrentValue()
+                                  << "  range=[" << r.getStart() << ", " << r.getEnd() << "]\n";
+                    }
+                    return nullptr;
+                }, &args);
+        });
+
+    // daw.get_param(track, name)  → number, or nil if not found
+    daw.set_function ("get_param",
+        [&edit](int trackIdx, const std::string& name,
+                sol::this_state ts) -> sol::object {
+            struct Args { te::Edit* edit; int idx; std::string name;
+                          bool ok; float value; };
+            Args args { &edit, trackIdx, name, false, 0.0f };
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size()) return nullptr;
+                    if (auto* p = findFirstPluginParam (tracks[a->idx - 1], a->name))
+                        { a->value = p->getCurrentValue(); a->ok = true; }
+                    return nullptr;
+                }, &args);
+            sol::state_view lv (ts);
+            return args.ok ? sol::make_object (lv, args.value) : sol::object (sol::lua_nil);
+        });
+
+    // daw.set_param(track, name, value)  → bool
+    daw.set_function ("set_param",
+        [&edit](int trackIdx, const std::string& name, double value) -> bool {
+            struct Args { te::Edit* edit; int idx; std::string name; float value;
+                          bool ok; std::string err; };
+            Args args { &edit, trackIdx, name, (float) value, false, {} };
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size())
+                        { a->err = "track index out of range"; return nullptr; }
+                    auto* p = findFirstPluginParam (tracks[a->idx - 1], a->name);
+                    if (! p) { a->err = "param not found: " + a->name; return nullptr; }
+                    p->setParameter (a->value, juce::sendNotification);
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+            if (! args.ok)
+                std::cerr << "[set_param error] " << args.err << "\n> " << std::flush;
             return args.ok;
         });
 
