@@ -1663,11 +1663,17 @@ static void registerDawApi (sol::state& lua,
     // case-insensitive match on the display name. Operates on the first
     // plugin in the track's chain. (See findFirstPluginParam above.)
 
-    // daw.list_params(track [, max=50]) — prints id, name, current, range
+    // daw.list_params(track [, filter [, max=50]])
+    // filter: case-insensitive substring on either paramID or display name.
+    //   daw.list_params(1, "filter")        -- everything matching "filter"
+    //   daw.list_params(1, "", 100)         -- first 100, no filter
+    //   daw.list_params(1)                  -- first 50, no filter
     daw.set_function ("list_params",
-        [&edit](int trackIdx, sol::optional<int> maxOpt) {
-            struct Args { te::Edit* edit; int idx; int max; };
-            Args args { &edit, trackIdx, maxOpt.value_or (50) };
+        [&edit](int trackIdx, sol::optional<std::string> filterOpt,
+                sol::optional<int> maxOpt) {
+            struct Args { te::Edit* edit; int idx; int max; std::string filter; };
+            Args args { &edit, trackIdx, maxOpt.value_or (50),
+                        filterOpt.value_or (std::string{}) };
             juce::MessageManager::getInstance()->callFunctionOnMessageThread (
                 [](void* ctx) -> void* {
                     auto* a = static_cast<Args*> (ctx);
@@ -1679,22 +1685,31 @@ static void registerDawApi (sol::state& lua,
                         { std::cout << "(no plugin on track)\n"; return nullptr; }
                     auto* plug = at->pluginList[0];
                     auto params = plug->getAutomatableParameters();
-                    int total = params.size();
-                    int shown = std::min (total, a->max);
-                    std::cout << "Track " << a->idx << " — "
-                              << plug->getName().toStdString()
-                              << " — " << total << " params"
-                              << (shown < total ? " (showing first " + std::to_string(shown) + ")" : "")
-                              << "\n";
-                    for (int i = 0; i < shown; ++i)
+                    juce::String filt (a->filter);
+                    int matched = 0, shown = 0;
+                    for (auto* p : params)
                     {
-                        auto* p = params[i];
+                        if (filt.isNotEmpty()
+                            && ! p->paramID.containsIgnoreCase (filt)
+                            && ! p->getParameterName().containsIgnoreCase (filt))
+                            continue;
+                        ++matched;
+                        if (shown >= a->max) continue;
+                        ++shown;
                         auto r = p->getValueRange();
                         std::cout << "  " << p->paramID.toStdString()
                                   << "  (" << p->getParameterName().toStdString() << ")"
                                   << "  cur=" << p->getCurrentValue()
                                   << "  range=[" << r.getStart() << ", " << r.getEnd() << "]\n";
                     }
+                    std::cout << "Track " << a->idx << " — "
+                              << plug->getName().toStdString()
+                              << " — " << params.size() << " params total";
+                    if (filt.isNotEmpty())
+                        std::cout << ", " << matched << " matched \"" << a->filter << "\"";
+                    if (shown < matched)
+                        std::cout << " (showing first " << shown << ")";
+                    std::cout << "\n";
                     return nullptr;
                 }, &args);
         });
