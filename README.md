@@ -74,6 +74,8 @@ daw.clip(track, slot).name       -- string
 -- Plugins
 daw.load_4osc(track)                          -- Tracktion built-in synth (works)
 daw.load_plugin(track, "/path/to/foo.vst3")   -- external VST3 (see known issues)
+daw.save_patch(track, "patches/my.xml")       -- save full plugin chain on track
+daw.load_patch(track, "patches/my.xml")       -- restore plugin chain (replaces existing)
 
 -- Scripts
 daw.load_script("scripts/foo.lua")   -- load + watch for hot reload

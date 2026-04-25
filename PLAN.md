@@ -244,6 +244,7 @@ In addition to script-driven `daw.emit`, the engine publishes a fixed set of bui
 | `audio_device_open`| `daw.open_audio_device`                       | `{name, ok, error?}`                       |
 | `midi_output_open` | `daw.open_midi_output`                        | `{name, ok}`                               |
 | `midi_input_route` | `daw.assign_midi_input` / `unassign_midi_input`| `{device, track, action, ok, error?}`     |
+| `patch`            | `daw.save_patch` / `daw.load_patch`           | `{track, path, plugins, action, ok, error?}`|
 
 Toggles: `daw.auto_emit(bool)` master switch (default on), `daw.auto_emit_midi_in(bool)` (default off because chatty). Scripts that want a different granularity can disable auto-emit and call `daw.emit` themselves.
 

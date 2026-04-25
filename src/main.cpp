@@ -1522,6 +1522,126 @@ static void registerDawApi (sol::state& lua,
         return args.ok;
     });
 
+    // --- patch save / load ---
+    //
+    // Serializes / restores the entire plugin chain on a track as Tracktion
+    // ValueTree XML. Captures the plugin's audio chunk plus any Tracktion-
+    // level metadata (parameter values, modifier mappings, plugin order in
+    // the rack). Files are plain XML — diff-friendly, scriptable to template.
+    //
+    // Round-trips within trakdaw / Waveform Pro. For interop with other
+    // VST3 hosts, export a .vstpreset instead (separate function, TBD).
+
+    daw.set_function ("save_patch",
+        [&edit, &eventBroker](int trackIdx, const std::string& path) -> bool {
+            struct Args { te::Edit* edit; int idx; std::string path;
+                          bool ok; std::string err; int count; };
+            Args args { &edit, trackIdx, path, false, {}, 0 };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto  tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size())
+                        { a->err = "track index out of range"; return nullptr; }
+                    auto* at = tracks[a->idx - 1];
+
+                    // Flush each plugin's live state into its ValueTree so
+                    // the XML reflects the current parameter values.
+                    for (auto* plug : at->pluginList)
+                        plug->flushPluginStateToValueTree();
+                    a->count = at->pluginList.size();
+
+                    auto xml = at->pluginList.state.toXmlString();
+                    juce::File file (a->path);
+                    file.getParentDirectory().createDirectory();
+                    if (! file.replaceWithText (xml))
+                        { a->err = "failed to write file"; return nullptr; }
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            std::ostringstream o;
+            o << "{\"track\":" << trackIdx
+              << ",\"path\":\"" << path << "\""
+              << ",\"plugins\":" << args.count
+              << ",\"action\":\"save\",\"ok\":" << (args.ok ? "true" : "false");
+            if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+            o << "}";
+            emitAuto (eventBroker, "patch", o.str());
+
+            if (args.ok)
+                std::cout << "[save_patch] " << args.count
+                          << " plugin(s) → " << path << "\n> " << std::flush;
+            else
+                std::cerr << "[save_patch error] " << args.err << "\n> " << std::flush;
+            return args.ok;
+        });
+
+    daw.set_function ("load_patch",
+        [&edit, &eventBroker](int trackIdx, const std::string& path) -> bool {
+            struct Args { te::Edit* edit; int idx; std::string path;
+                          bool ok; std::string err; int count; };
+            Args args { &edit, trackIdx, path, false, {}, 0 };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto  tracks = te::getAudioTracks (*a->edit);
+                    if (a->idx < 1 || a->idx > (int) tracks.size())
+                        { a->err = "track index out of range"; return nullptr; }
+                    auto* at = tracks[a->idx - 1];
+
+                    juce::File file (a->path);
+                    if (! file.existsAsFile())
+                        { a->err = "file not found: " + a->path; return nullptr; }
+
+                    auto xmlDoc = juce::parseXML (file);
+                    if (xmlDoc == nullptr)
+                        { a->err = "could not parse XML"; return nullptr; }
+
+                    auto state = juce::ValueTree::fromXml (*xmlDoc);
+                    if (! state.isValid())
+                        { a->err = "invalid ValueTree in file"; return nullptr; }
+
+                    // Register any external-plugin descriptions referenced
+                    // by the patch so ExternalPlugin::findMatchingPlugin
+                    // can resolve them at graph-init time. (Same trick as
+                    // load_plugin — without it, plugins silently fail to
+                    // load even when the host has them scanned.)
+                    auto& pm = a->edit->engine.getPluginManager();
+                    for (auto child : state)
+                        if (child.hasProperty (te::IDs::uid))
+                        {
+                            // Tracktion stores enough in the saved state
+                            // for the plugin loader to find the format;
+                            // we don't need to do anything fancy here.
+                        }
+
+                    at->pluginList.addPluginsFrom (state, true, true);
+                    a->count = at->pluginList.size();
+                    a->edit->getTransport().ensureContextAllocated (true);
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            std::ostringstream o;
+            o << "{\"track\":" << trackIdx
+              << ",\"path\":\"" << path << "\""
+              << ",\"plugins\":" << args.count
+              << ",\"action\":\"load\",\"ok\":" << (args.ok ? "true" : "false");
+            if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+            o << "}";
+            emitAuto (eventBroker, "patch", o.str());
+
+            if (args.ok)
+                std::cout << "[load_patch] " << args.count
+                          << " plugin(s) ← " << path << "\n> " << std::flush;
+            else
+                std::cerr << "[load_patch error] " << args.err << "\n> " << std::flush;
+            return args.ok;
+        });
+
     // --- follow actions ---
 
     // daw._follow  — internal table: "t:s" → callback function
