@@ -72,8 +72,8 @@ daw.clip(track, slot).playing()  -- bool
 daw.clip(track, slot).name       -- string
 
 -- Plugins
-daw.load_4osc(track)                          -- Tracktion built-in synth (works)
-daw.load_plugin(track, "/path/to/foo.vst3")   -- external VST3 (see known issues)
+daw.load_4osc(track)                          -- Tracktion built-in synth
+daw.load_plugin(track, "/path/to/foo.vst3")   -- external VST3 (verified with Surge XT)
 daw.save_patch(track, "patches/my.xml")       -- save full plugin chain on track
 daw.load_patch(track, "patches/my.xml")       -- restore plugin chain (replaces existing)
 daw.list_params(track [, max=50])             -- print id, name, value, range
@@ -170,13 +170,7 @@ daw.load_script("scripts/clip_launcher.lua")
 ## Known Issues
 
 ### Clip looping (fix attempted, needs audio verification)
-`daw.clip(t,s).launch()` now reads `MidiClip::getLoopLengthBeats()` first, falling back to `getEndBeat() - getStartBeat()` for freshly-inserted clips whose `loopLengthBeats` defaults to 0. Setting is gated on a non-zero duration. Verified to compile and run without crash; needs a JACK/PipeWire session to confirm audio actually loops.
-
-### VST3 plugins (e.g. Surge XT) — verified
-`daw.load_plugin(track, path)` registers the scanned `PluginDescription` with `PluginManager::knownPluginList` before inserting. Without that, Tracktion's `ExternalPlugin::findMatchingPlugin()` can't resolve the description during graph init and `doFullInitialisation()` silently bails. Verified end-to-end with Surge XT on Linux (JACK/PipeWire) — `daw.show_editor(track)` opens the native GUI, `daw.note_on` drives the synth. Required bumping JUCE to pull in the Linux VST XEmbed/wrapper-window fixes.
-
-### Shutdown
-Ctrl+C now exits cleanly via JUCE's built-in SIGINT handler (which posts a quit through the message loop and triggers `Engine::~Engine()`). Earlier versions of this code may have raced; the current shutdown ordering (REPL → Python → MIDI → Edit → Engine) cleans up correctly.
+`daw.clip(t,s).launch()` reads `MidiClip::getLoopLengthBeats()` first, falling back to `getEndBeat() - getStartBeat()` for freshly-inserted clips whose `loopLengthBeats` defaults to 0. Setting is gated on a non-zero duration. Compiles and runs without crash; still needs an audio session that exercises clip looping end-to-end to confirm.
 
 ## Phases Completed
 
@@ -188,12 +182,14 @@ Ctrl+C now exits cleanly via JUCE's built-in SIGINT handler (which posts a quit 
 | 4 | Hot reload (file watch, bar-boundary sync, `daw.load_script`) |
 | 5 | Python arrangement layer (pybind11 embed, `daw` Python module, timeline clips) |
 | 6 | Follow actions (polling `LaunchHandle::PlayState`, `daw.on_end`, drunk walk) |
+| 7 | HTTP `/eval` + SSE `/events`, web UI with live clip grid, MIDI output, native MIDI input routing, VST plugin editor windows, beat-based scheduler, patch save/load, parameter API |
 
 ## Planned
 
-- Phase 7 continued: WebSocket transport (the HTTP `/eval` endpoint is in)
+- WebSocket transport for `/eval` (currently HTTP POST; SSE handles push)
 - Plugin editor support for Tracktion built-ins (currently `show_editor` is VST-only)
-- Clip looping fix — verify
+- Clip looping — verify in a real audio session
+- `.vstpreset` export for cross-DAW patch interop
 
 ## License
 
