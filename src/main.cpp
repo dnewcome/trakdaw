@@ -1031,10 +1031,19 @@ static void registerDawApi (sol::state& lua,
         std::cout << "Position:      " << edit.getTransport().getPosition().inSeconds() << "s\n";
     });
 
-    daw.set_function ("bpm", [&edit]() -> double {
-        return edit.tempoSequence.getTempo (0)->getBpm();
-    });
+    // daw.bpm()       → read current BPM
+    // daw.bpm(120)    → set BPM. Overloaded so both calls feel natural.
+    daw.set_function ("bpm", sol::overload (
+        [&edit]() -> double {
+            return edit.tempoSequence.getTempo (0)->getBpm();
+        },
+        [&edit](double bpm) {
+            juce::MessageManager::callAsync ([&edit, bpm] {
+                edit.tempoSequence.getTempo (0)->setBpm (bpm);
+            });
+        }));
 
+    // Kept for backward compat — daw.bpm(N) is the new idiom.
     daw.set_function ("set_bpm", [&edit](double bpm) {
         juce::MessageManager::callAsync ([&edit, bpm] {
             edit.tempoSequence.getTempo (0)->setBpm (bpm);

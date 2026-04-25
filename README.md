@@ -64,8 +64,9 @@ daw.playing()          -- bool
 daw.position()         -- seconds
 daw.position_beats()   -- total beats since start (fractional)
 daw.position_bars()    -- { bar=N, beat=N.f, numerator=N }  -- 1-based for musical display
-daw.bpm()
-daw.set_bpm(140)
+daw.bpm()              -- read current
+daw.bpm(140)           -- set
+daw.set_bpm(140)       -- alias for the setter
 
 -- Clip slots (1-based)
 daw.clip(track, slot).launch()
