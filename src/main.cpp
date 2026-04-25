@@ -2405,7 +2405,7 @@ public:
                   << edit->tempoSequence.getTempo (0)->getBpm() << " BPM\n";
 
         // 5. Clip grid
-        edit->ensureNumberOfAudioTracks (2);
+        edit->ensureNumberOfAudioTracks (3);
         edit->getSceneList().ensureNumberOfScenes (2);
         auto tracks = te::getAudioTracks (*edit);
         for (auto* at : tracks)

@@ -132,15 +132,13 @@ daw.store.mykey = value
 
 ## Clip Grid
 
-```
-         Slot 1        Slot 2
-Track 1  Bass A        Bass B
-(Bass)   16-beat C     16-beat D
-         groove        groove
+Edit starts with 3 tracks × 2 clip slots. The browser UI auto-expands if events arrive for higher track/slot indices.
 
-Track 2  Melody A      Melody B
-(Melody) 8-beat C maj  8-beat A min
-         pentatonic    pentatonic
+```
+         Slot 1   Slot 2
+Track 1  ----     ----      ← bass (in examples/demo_jam.lua)
+Track 2  ----     ----      ← lead
+Track 3  ----     ----      ← drums
 ```
 
 ## Example Scripts
