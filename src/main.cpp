@@ -2511,7 +2511,22 @@ public:
         midiInputs.clear();
         midiHandler.reset();
 
-        if (edit) { edit->getTransport().stop (false, false); edit.reset(); }
+        if (edit)
+        {
+            edit->getTransport().stop (false, false);
+
+            // Unload plugins explicitly before destroying the Edit so any
+            // async cleanup (VST3 host context release, X11 wrapper-window
+            // teardown) gets a chance to run on the message thread while
+            // it's still pumping. Otherwise on Linux JUCE's leak detector
+            // catches a residual VST3HostContextHeadless / RunLoop /
+            // SharedResourcePointer / AsyncUpdater on app exit.
+            for (auto* at : te::getAudioTracks (*edit))
+                at->pluginList.clear();
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+
+            edit.reset();
+        }
         if (engine)
         {
             engine->getTemporaryFileManager().getTempDirectory().deleteRecursively();

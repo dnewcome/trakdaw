@@ -169,11 +169,6 @@ Maps MIDI notes C3/D3 to clip slot launches.
 daw.load_script("scripts/clip_launcher.lua")
 ```
 
-## Known Issues
-
-### Clip looping (fix attempted, needs audio verification)
-`daw.clip(t,s).launch()` reads `MidiClip::getLoopLengthBeats()` first, falling back to `getEndBeat() - getStartBeat()` for freshly-inserted clips whose `loopLengthBeats` defaults to 0. Setting is gated on a non-zero duration. Compiles and runs without crash; still needs an audio session that exercises clip looping end-to-end to confirm.
-
 ## Phases Completed
 
 | Phase | Description |
@@ -190,7 +185,6 @@ daw.load_script("scripts/clip_launcher.lua")
 
 - WebSocket transport for `/eval` (currently HTTP POST; SSE handles push)
 - Plugin editor support for Tracktion built-ins (currently `show_editor` is VST-only)
-- Clip looping — verify in a real audio session
 - `.vstpreset` export for cross-DAW patch interop
 
 ## License
