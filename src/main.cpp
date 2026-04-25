@@ -821,6 +821,28 @@ static void registerDawApi (sol::state& lua,
         return edit.getTransport().getPosition().inSeconds();
     });
 
+    // daw.position_beats() — total beats since edit start (fractional)
+    daw.set_function ("position_beats", [&edit]() -> double {
+        auto pos = edit.getTransport().getPosition();
+        return edit.tempoSequence.toBeats (pos).inBeats();
+    });
+
+    // daw.position_bars() → { bar, beat, numerator } (1-based for musical display)
+    //   bar 1, beat 1.0   = start of edit
+    //   bar 2, beat 1.0   = after one full bar
+    //   bar 1, beat 3.5   = halfway between beat 3 and beat 4 of bar 1
+    daw.set_function ("position_bars",
+        [&edit](sol::this_state ts) -> sol::table {
+            auto pos = edit.getTransport().getPosition();
+            auto bb  = edit.tempoSequence.toBarsAndBeats (pos);
+            sol::state_view lv (ts);
+            sol::table t = lv.create_table();
+            t["bar"]       = bb.bars + 1;
+            t["beat"]      = bb.beats.inBeats() + 1.0;
+            t["numerator"] = bb.numerator;
+            return t;
+        });
+
     daw.set_function ("playing", [&edit]() -> bool {
         return edit.getTransport().isPlaying();
     });

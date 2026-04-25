@@ -62,6 +62,8 @@ daw.play()
 daw.stop()
 daw.playing()          -- bool
 daw.position()         -- seconds
+daw.position_beats()   -- total beats since start (fractional)
+daw.position_bars()    -- { bar=N, beat=N.f, numerator=N }  -- 1-based for musical display
 daw.bpm()
 daw.set_bpm(140)
 
