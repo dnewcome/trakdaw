@@ -37,6 +37,24 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
   .cell.on .name { color:#d1fae5; }
   .cell.flash { background:#7c2d12 !important; border-color:#fb923c !important; }
 
+  #tracks  { padding:10px; overflow:auto; }
+  .track   { display:flex; gap:14px; padding:8px 0; border-bottom:1px solid #11141b;
+             align-items:center; flex-wrap:wrap; }
+  .track:last-child { border-bottom:none; }
+  .track-idx { color:#7dd3fc; font-size:11px; letter-spacing:2px; min-width:34px; }
+  .track-name { color:#d8dee9; font-size:13px; min-width:80px; }
+  .pchain  { display:flex; gap:6px; flex-wrap:wrap; }
+  .plug    { background:#12222e; border:1px solid #1e3a4d; padding:3px 8px;
+             font-size:11px; color:#a5f3fc; border-radius:2px; }
+  .plug.builtin { background:#1f2430; color:#94a3b8; border-color:#1f2430; }
+  .plug.error { background:#451a1a; border-color:#7f1d1d; color:#fca5a5; }
+  .plug-format { color:#475569; margin-left:6px; font-size:10px; }
+  .empty   { color:#475569; font-style:italic; font-size:11px; }
+  .clipdot { width:8px; height:8px; border-radius:50%; background:#1f2430;
+             display:inline-block; margin-right:3px; }
+  .clipdot.has  { background:#475569; }
+  .clipdot.on   { background:#10b981; box-shadow:0 0 6px #10b981; }
+
   textarea { flex:1; min-height:80px; background:#0b0d12; color:#a5f3fc;
              border:none; padding:10px; font:inherit; resize:none; outline:none; }
   #result  { background:#0b0d12; color:#fde68a; padding:10px; white-space:pre-wrap;
@@ -70,6 +88,10 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
   <section id="grid-panel">
     <h2>clip grid <span class="sub" id="grid-dims">—</span></h2>
     <div id="grid"></div>
+  </section>
+  <section id="tracks-panel" style="grid-column: 1 / -1;">
+    <h2>tracks <span class="sub" id="tracks-meta">—</span></h2>
+    <div id="tracks"></div>
   </section>
   <section>
     <h2>eval <span class="sub">post /eval</span></h2>
@@ -188,6 +210,14 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
   rebuildGrid();
 
   // --- SSE connection ---
+  // Events that imply track/plugin/clip/transport state may have changed
+  // — when one fires, refresh the tracks panel.
+  const REFRESH_EVENTS = new Set([
+    'plugin_load', 'plugin_editor', 'transport',
+    'midi_input_route', 'patch', 'script_load',
+    'clip_launch', 'clip_stop', 'follow',
+  ]);
+
   function connect() {
     const es = new EventSource('/events');
     es.onopen  = () => append('connected to /events', 'sys');
@@ -198,6 +228,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
         handleClipEvent(obj.name, obj.data);
       if (obj.name === 'transport' && obj.data)
         $('transport').textContent = obj.data.playing ? 'playing' : 'stopped';
+      if (REFRESH_EVENTS.has(obj.name)) refreshState();
       const ts = new Date().toLocaleTimeString();
       const d  = obj.data !== undefined ? '<span class="data">'+esc(JSON.stringify(obj.data))+'</span>' : '';
       append('<span class="ts">'+ts+'</span><span class="name">'+esc(obj.name)+'</span>'+d);
@@ -205,9 +236,56 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
   }
   connect();
 
-  // One-shot bpm fetch so the header isn't blank on load.
-  fetch('/eval', { method:'POST', body:'daw.bpm()' })
-    .then(r => r.text()).then(t => { $('bpm').textContent = t.trim(); }).catch(()=>{});
+  // --- tracks panel: refresh from daw.state() on load and on relevant events ---
+  // Lua-as-query: the engine doesn't push a state schema; we ask for one.
+  async function refreshState() {
+    try {
+      const r = await fetch('/eval', { method:'POST', body:'return daw.state()' });
+      const txt = await r.text();
+      const st = JSON.parse(txt);
+      renderTracks(st);
+      $('bpm').textContent = String(Math.round(st.bpm));
+      $('transport').textContent = st.playing ? 'playing' : 'stopped';
+      $('tracks-meta').textContent =
+        st.tracks.length + ' tracks · bar ' + st.bar +
+        ' · beat ' + st.beat.toFixed(2);
+    } catch (e) { /* server may not be ready yet on first paint */ }
+  }
+
+  function renderTracks(st) {
+    const root = $('tracks');
+    root.innerHTML = '';
+    for (const t of st.tracks) {
+      const row = document.createElement('div');
+      row.className = 'track';
+      const idx = '<span class="track-idx">T' + t.index + '</span>';
+      const nm  = '<span class="track-name">' + esc(t.name || '') + '</span>';
+      let chain = '<div class="pchain">';
+      if (!t.plugins.length) {
+        chain += '<span class="empty">no plugin</span>';
+      } else {
+        for (const p of t.plugins) {
+          const cls = p.error ? 'plug error'
+                    : (p.format === 'builtin' ? 'plug builtin' : 'plug');
+          chain += '<span class="' + cls + '">' + esc(p.name)
+                +  '<span class="plug-format">' + esc(p.format) + '</span>'
+                +  '</span>';
+        }
+      }
+      chain += '</div>';
+      let dots = '<div class="pchain">';
+      for (const c of t.clips) {
+        const cls = c.playing ? 'clipdot on' : (c.name ? 'clipdot has' : 'clipdot');
+        dots += '<span class="' + cls + '" title="slot ' + c.slot
+              + (c.name ? ': ' + esc(c.name) : '') + '"></span>';
+      }
+      dots += '</div>';
+      row.innerHTML = idx + nm + chain + dots;
+      root.appendChild(row);
+    }
+  }
+
+  refreshState();
 })();
 </script>
 </body>

@@ -1015,6 +1015,101 @@ static void registerDawApi (sol::state& lua,
         emitAuto (eventBroker, "audio_device_open", o.str());
     });
 
+    // daw.state() → JSON string snapshot of bpm, transport, tracks, plugins,
+    // and clip slots. Returned as a string so /eval round-trips it verbatim
+    // and the browser can JSON.parse it directly. Lua-as-query: scripts can
+    // also call this and emit/log subsets.
+    daw.set_function ("state", [&edit]() -> std::string {
+        struct Args { te::Edit* edit; std::string out; };
+        Args args { &edit, {} };
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void* ctx) -> void* {
+                auto* a = static_cast<Args*> (ctx);
+                auto esc = [](const std::string& s) {
+                    std::string r; r.reserve (s.size() + 2);
+                    for (unsigned char c : s) {
+                        switch (c) {
+                            case '"':  r += "\\\""; break;
+                            case '\\': r += "\\\\"; break;
+                            case '\n': r += "\\n";  break;
+                            case '\r': r += "\\r";  break;
+                            case '\t': r += "\\t";  break;
+                            default:
+                                if (c < 0x20) {
+                                    char buf[8];
+                                    std::snprintf (buf, sizeof buf, "\\u%04x", (unsigned) c);
+                                    r += buf;
+                                } else r += (char) c;
+                        }
+                    }
+                    return r;
+                };
+                std::ostringstream o;
+                auto& tr = a->edit->getTransport();
+                auto pos = tr.getPosition();
+                auto bb  = a->edit->tempoSequence.toBarsAndBeats (pos);
+                o << "{\"bpm\":" << a->edit->tempoSequence.getTempo (0)->getBpm()
+                  << ",\"playing\":" << (tr.isPlaying() ? "true" : "false")
+                  << ",\"position\":" << pos.inSeconds()
+                  << ",\"position_beats\":" << a->edit->tempoSequence.toBeats (pos).inBeats()
+                  << ",\"bar\":" << (bb.bars + 1)
+                  << ",\"beat\":" << (bb.beats.inBeats() + 1.0)
+                  << ",\"tracks\":[";
+                auto tracks = te::getAudioTracks (*a->edit);
+                for (int i = 0; i < (int) tracks.size(); ++i)
+                {
+                    if (i > 0) o << ",";
+                    auto* at = tracks[i];
+                    o << "{\"index\":" << (i + 1)
+                      << ",\"name\":\"" << esc (at->getName().toStdString()) << "\""
+                      << ",\"plugins\":[";
+                    int pi = 0;
+                    for (auto* plug : at->pluginList)
+                    {
+                        if (pi++ > 0) o << ",";
+                        o << "{\"name\":\"" << esc (plug->getName().toStdString()) << "\""
+                          << ",\"type\":\"" << esc (plug->getPluginType().toStdString()) << "\"";
+                        if (auto* ep = dynamic_cast<te::ExternalPlugin*> (plug))
+                        {
+                            o << ",\"format\":\"VST\",\"synth\":"
+                              << (ep->isSynth() ? "true" : "false");
+                            auto err = ep->getLoadError();
+                            if (err.isNotEmpty())
+                                o << ",\"error\":\"" << esc (err.toStdString()) << "\"";
+                        }
+                        else
+                        {
+                            o << ",\"format\":\"builtin\"";
+                        }
+                        o << "}";
+                    }
+                    o << "],\"clips\":[";
+                    auto slots = at->getClipSlotList().getClipSlots();
+                    for (int s = 0; s < (int) slots.size(); ++s)
+                    {
+                        if (s > 0) o << ",";
+                        o << "{\"slot\":" << (s + 1);
+                        if (auto* clip = slots[s]->getClip())
+                        {
+                            o << ",\"name\":\"" << esc (clip->getName().toStdString()) << "\"";
+                            if (auto lh = clip->getLaunchHandle())
+                            {
+                                bool playing = lh->getPlayingStatus()
+                                               == te::LaunchHandle::PlayState::playing;
+                                o << ",\"playing\":" << (playing ? "true" : "false");
+                            }
+                        }
+                        o << "}";
+                    }
+                    o << "]}";
+                }
+                o << "]}";
+                a->out = o.str();
+                return nullptr;
+            }, &args);
+        return args.out;
+    });
+
     daw.set_function ("audio_info", [&edit]() {
         auto& dm  = edit.engine.getDeviceManager();
         auto* dev = dm.deviceManager.getCurrentAudioDevice();
