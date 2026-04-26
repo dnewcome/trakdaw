@@ -76,7 +76,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
     <textarea id="code" spellcheck="false" placeholder="daw.bpm()">daw.bpm()</textarea>
     <div class="bar">
       <button id="run">run</button>
-      <span class="hint">ctrl/cmd + enter</span>
+      <span class="hint">ctrl/cmd + enter — selection only if any, else whole buffer</span>
     </div>
     <pre id="result"></pre>
   </section>
@@ -95,9 +95,15 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
   const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
   // --- eval ---
+  // Send the current selection if there is one, otherwise the whole buffer.
+  // Lets you keep a scratch sheet of snippets in the textarea and fire any
+  // chunk by selecting it.
   async function run() {
+    const ta = $('code');
+    const sel = ta.value.substring(ta.selectionStart, ta.selectionEnd);
+    const code = sel.length > 0 ? sel : ta.value;
     try {
-      const r = await fetch('/eval', { method:'POST', body: $('code').value });
+      const r = await fetch('/eval', { method:'POST', body: code });
       $('result').textContent = await r.text();
     } catch (e) { $('result').textContent = 'error: ' + e.message; }
   }
