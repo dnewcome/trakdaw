@@ -1130,23 +1130,35 @@ static void registerDawApi (sol::state& lua,
     });
 
     // daw.bpm()       → read current BPM
-    // daw.bpm(120)    → set BPM. Overloaded so both calls feel natural.
+    // daw.bpm(120)    → set BPM, returns the value as applied (or coerced).
+    // Both forms run synchronously on the message thread so the returned
+    // value is the live current BPM — useful at the REPL ("did it stick?")
+    // and in scripts (no need to query separately).
+    auto applyBpm = [&edit, &eventBroker](double bpm) -> double {
+        struct Args { te::Edit* edit; double bpm; double after; };
+        Args args { &edit, bpm, 0.0 };
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void* ctx) -> void* {
+                auto* a = static_cast<Args*> (ctx);
+                a->edit->tempoSequence.getTempo (0)->setBpm (a->bpm);
+                a->after = a->edit->tempoSequence.getTempo (0)->getBpm();
+                return nullptr;
+            }, &args);
+        std::ostringstream o;
+        o << "{\"bpm\":" << args.after << "}";
+        emitAuto (eventBroker, "bpm", o.str());
+        return args.after;
+    };
+
     daw.set_function ("bpm", sol::overload (
         [&edit]() -> double {
             return edit.tempoSequence.getTempo (0)->getBpm();
         },
-        [&edit](double bpm) {
-            juce::MessageManager::callAsync ([&edit, bpm] {
-                edit.tempoSequence.getTempo (0)->setBpm (bpm);
-            });
-        }));
+        [applyBpm](double bpm) -> double { return applyBpm (bpm); }));
 
     // Kept for backward compat — daw.bpm(N) is the new idiom.
-    daw.set_function ("set_bpm", [&edit](double bpm) {
-        juce::MessageManager::callAsync ([&edit, bpm] {
-            edit.tempoSequence.getTempo (0)->setBpm (bpm);
-        });
-    });
+    daw.set_function ("set_bpm",
+        [applyBpm](double bpm) -> double { return applyBpm (bpm); });
 
     // --- clips ---
 

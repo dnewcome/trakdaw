@@ -213,7 +213,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
   // Events that imply track/plugin/clip/transport state may have changed
   // — when one fires, refresh the tracks panel.
   const REFRESH_EVENTS = new Set([
-    'plugin_load', 'plugin_editor', 'transport',
+    'plugin_load', 'plugin_editor', 'transport', 'bpm',
     'midi_input_route', 'patch', 'script_load',
     'clip_launch', 'clip_stop', 'follow',
   ]);
