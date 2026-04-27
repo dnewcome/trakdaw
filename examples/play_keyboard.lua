@@ -11,6 +11,9 @@ local SURGE        = "/usr/lib/vst3/Surge XT.vst3"
 local TRACK        = 1
 local DEVICE_HINT  = "All MIDI"   -- fuzzy match; "" picks the first device
 
+-- Catches a keyboard plugged in after trakdaw was already running.
+daw.rescan_midi()
+
 daw.load_plugin(TRACK, SURGE)
 daw.show_editor(TRACK)
 

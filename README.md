@@ -103,7 +103,13 @@ daw.run_python("scripts/foo.py")     -- run Python arrangement script
 daw.on_end(track, slot, function(info) ... end)  -- callback when clip finishes
 daw.trigger_follow(track, slot)                  -- manually fire callback (testing)
 
--- MIDI
+-- MIDI input (Tracktion native routing — keyboards/controllers play instruments directly)
+daw.list_engine_midi_inputs()
+daw.assign_midi_input(name, track)             -- name is fuzzy substring; "All MIDI" routes everything
+daw.unassign_midi_input(name, track)
+daw.rescan_midi()                              -- pick up devices plugged in after startup
+
+-- MIDI raw callback path (script handles routing)
 daw.inject_midi(note, velocity [, channel])    -- fires Lua on_midi callback
 daw.note_on(track, note, velocity [, channel]) -- play instrument on track
 daw.note_off(track, note [, channel])          -- stop instrument note

@@ -1834,6 +1834,27 @@ static void registerDawApi (sol::state& lua,
     // through both.
 
     // daw.list_engine_midi_inputs() — Tracktion's view of MIDI input devices
+    // daw.rescan_midi() — ask Tracktion to re-enumerate MIDI input/output
+    // devices. Useful when a keyboard or controller is plugged in after
+    // trakdaw started up; otherwise it won't show in list_engine_midi_inputs
+    // until next launch.
+    daw.set_function ("rescan_midi", [&edit, &eventBroker]() {
+        struct Args { te::Edit* edit; int count; };
+        Args args { &edit, 0 };
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void* ctx) -> void* {
+                auto* a = static_cast<Args*> (ctx);
+                a->edit->engine.getDeviceManager().rescanMidiDeviceList();
+                a->count = (int) a->edit->engine.getDeviceManager().getMidiInDevices().size();
+                return nullptr;
+            }, &args);
+        std::ostringstream o;
+        o << "{\"midi_in_count\":" << args.count << "}";
+        emitAuto (eventBroker, "midi_rescan", o.str());
+        std::cout << "[midi] rescanned — " << args.count
+                  << " input device(s) visible\n" << std::flush;
+    });
+
     daw.set_function ("list_engine_midi_inputs", [&edit]() {
         juce::MessageManager::getInstance()->callFunctionOnMessageThread (
             [](void* ctx) -> void* {
