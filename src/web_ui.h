@@ -218,7 +218,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
     'plugin_load', 'plugin_editor', 'transport', 'bpm', 'track_add',
     'midi_input_route', 'patch', 'script_load',
     'clip_launch', 'clip_stop', 'follow',
-    'clip_create', 'clip_clear',
+    'clip_create', 'clip_clear', 'reset',
   ]);
 
   function connect() {

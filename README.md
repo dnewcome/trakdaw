@@ -81,6 +81,9 @@ daw.clear_clip(track, slot)
 daw.tracks()                                  -- list track names
 daw.add_track()                               -- add one; returns new index
 
+-- Wipe session content (preserves tracks, BPM, daw.store)
+daw.reset()
+
 -- Plugins
 daw.load_4osc(track)                          -- Tracktion built-in synth
 daw.load_plugin(track, "/path/to/foo.vst3")   -- external VST3 (verified with Surge XT)

@@ -1388,6 +1388,58 @@ static void registerDawApi (sol::state& lua,
             return args.ok;
         });
 
+    // daw.reset() — wipe all session content back to a clean slate.
+    //   - stops transport
+    //   - cancels every scheduled task (daw.after / daw.every)
+    //   - clears every on_end follow callback
+    //   - removes every clip from every slot
+    //   - unloads every plugin from every track
+    //   - closes any open plugin editor windows
+    // Preserved: track count, BPM, daw.store, MIDI input/output device
+    // routing. (Clear those manually if you want a truly empty edit.)
+    daw.set_function ("reset",
+        [&edit, &eventBroker, &pluginEditors, &scheduler]
+        (sol::this_state ts) {
+            scheduler.clear();
+
+            // Wipe the Lua-side follow callback table so callbacks from
+            // the previous setup don't fire after the engine state changes.
+            sol::state_view lv (ts);
+            lv["daw"]["_follow"] = lv.create_table();
+
+            struct Args { te::Edit* edit; PluginEditorMap* wins;
+                          int trackCount; int pluginCount; int clipCount; };
+            Args args { &edit, &pluginEditors, 0, 0, 0 };
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    a->edit->getTransport().stop (false, false);
+                    a->wins->clear();
+                    auto tracks = te::getAudioTracks (*a->edit);
+                    a->trackCount = tracks.size();
+                    for (auto* at : tracks)
+                    {
+                        a->pluginCount += at->pluginList.size();
+                        at->pluginList.clear();
+                        for (auto* slot : at->getClipSlotList().getClipSlots())
+                            if (auto* clip = slot->getClip())
+                                { ++a->clipCount; clip->removeFromParent(); }
+                    }
+                    a->edit->getTransport().ensureContextAllocated (true);
+                    return nullptr;
+                }, &args);
+
+            std::ostringstream o;
+            o << "{\"tracks\":" << args.trackCount
+              << ",\"plugins_removed\":" << args.pluginCount
+              << ",\"clips_removed\":"   << args.clipCount << "}";
+            emitAuto (eventBroker, "reset", o.str());
+            std::cout << "[reset] cleared " << args.pluginCount
+                      << " plugins and " << args.clipCount
+                      << " clips across " << args.trackCount
+                      << " tracks\n" << std::flush;
+        });
+
     // --- MIDI ---
 
     // daw.inject_midi(note, vel [, channel=1])
