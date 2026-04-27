@@ -73,6 +73,9 @@ daw.clip(track, slot).launch()
 daw.clip(track, slot).stop()
 daw.clip(track, slot).playing()  -- bool
 daw.clip(track, slot).name       -- string
+daw.create_clip(track, slot [, beats=4])    -- empty MIDI clip in slot
+daw.add_note(track, slot, pitch, start_beat, length_beats [, vel=100])
+daw.clear_clip(track, slot)
 
 -- Tracks
 daw.tracks()                                  -- list track names

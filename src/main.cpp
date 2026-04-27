@@ -1272,6 +1272,122 @@ static void registerDawApi (sol::state& lua,
         return args.newIdx;
     });
 
+    // daw.create_clip(track, slot [, length_beats=4])
+    // Inserts an empty MIDI clip into the slot. Errors out if the slot is
+    // already occupied — clear the existing clip first if you want to
+    // replace. Length is set from current BPM at call time.
+    daw.set_function ("create_clip",
+        [&edit, &eventBroker](int trackIdx, int slotIdx,
+                              sol::optional<double> beatsOpt) -> bool {
+            struct Args { te::Edit* edit; int trackIdx; int slotIdx;
+                          double beats; bool ok; std::string err; };
+            Args args { &edit, trackIdx, slotIdx, beatsOpt.value_or (4.0),
+                        false, {} };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto tracks = te::getAudioTracks (*a->edit);
+                    if (a->trackIdx < 1 || a->trackIdx > (int) tracks.size())
+                        { a->err = "track out of range"; return nullptr; }
+                    auto slots = tracks[a->trackIdx - 1]->getClipSlotList().getClipSlots();
+                    if (a->slotIdx < 1 || a->slotIdx > (int) slots.size())
+                        { a->err = "slot out of range"; return nullptr; }
+                    auto* slot = slots[a->slotIdx - 1];
+                    if (slot->getClip() != nullptr)
+                        { a->err = "slot already has a clip"; return nullptr; }
+                    auto end = a->edit->tempoSequence.toTime (
+                                   te::BeatPosition::fromBeats (a->beats));
+                    auto clip = te::insertMIDIClip (*slot,
+                                                    te::TimeRange { te::TimePosition{}, end });
+                    if (clip == nullptr)
+                        { a->err = "insertMIDIClip failed"; return nullptr; }
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            std::ostringstream o;
+            o << "{\"track\":" << trackIdx << ",\"slot\":" << slotIdx
+              << ",\"beats\":" << args.beats
+              << ",\"ok\":" << (args.ok ? "true" : "false");
+            if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+            o << "}";
+            emitAuto (eventBroker, "clip_create", o.str());
+            if (! args.ok)
+                std::cerr << "[create_clip error] " << args.err << "\n" << std::flush;
+            return args.ok;
+        });
+
+    // daw.add_note(track, slot, pitch, start_beat, length_beats [, vel=100])
+    // Adds one MIDI note to the clip at (track, slot). Beats are within the
+    // clip's local timeline (0 = start of clip). Velocity 1..127.
+    daw.set_function ("add_note",
+        [&edit](int trackIdx, int slotIdx, int pitch,
+                double startBeat, double lengthBeats,
+                sol::optional<int> velOpt) -> bool {
+            struct Args { te::Edit* edit; int trackIdx; int slotIdx;
+                          int pitch; double start; double length; int vel;
+                          bool ok; std::string err; };
+            Args args { &edit, trackIdx, slotIdx, pitch, startBeat, lengthBeats,
+                        velOpt.value_or (100), false, {} };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto tracks = te::getAudioTracks (*a->edit);
+                    if (a->trackIdx < 1 || a->trackIdx > (int) tracks.size())
+                        { a->err = "track out of range"; return nullptr; }
+                    auto slots = tracks[a->trackIdx - 1]->getClipSlotList().getClipSlots();
+                    if (a->slotIdx < 1 || a->slotIdx > (int) slots.size())
+                        { a->err = "slot out of range"; return nullptr; }
+                    auto* clip = dynamic_cast<te::MidiClip*> (slots[a->slotIdx - 1]->getClip());
+                    if (clip == nullptr)
+                        { a->err = "no MIDI clip in slot — call create_clip first"; return nullptr; }
+                    clip->getSequence().addNote (
+                        a->pitch,
+                        te::BeatPosition::fromBeats (a->start),
+                        te::BeatDuration::fromBeats (a->length),
+                        a->vel, 0, nullptr);
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            if (! args.ok)
+                std::cerr << "[add_note error] " << args.err << "\n" << std::flush;
+            return args.ok;
+        });
+
+    // daw.clear_clip(track, slot) — remove the clip from a slot
+    daw.set_function ("clear_clip",
+        [&edit, &eventBroker](int trackIdx, int slotIdx) -> bool {
+            struct Args { te::Edit* edit; int trackIdx; int slotIdx;
+                          bool ok; std::string err; };
+            Args args { &edit, trackIdx, slotIdx, false, {} };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    auto tracks = te::getAudioTracks (*a->edit);
+                    if (a->trackIdx < 1 || a->trackIdx > (int) tracks.size())
+                        { a->err = "track out of range"; return nullptr; }
+                    auto slots = tracks[a->trackIdx - 1]->getClipSlotList().getClipSlots();
+                    if (a->slotIdx < 1 || a->slotIdx > (int) slots.size())
+                        { a->err = "slot out of range"; return nullptr; }
+                    if (auto* clip = slots[a->slotIdx - 1]->getClip())
+                        clip->removeFromParent();
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            std::ostringstream o;
+            o << "{\"track\":" << trackIdx << ",\"slot\":" << slotIdx
+              << ",\"ok\":" << (args.ok ? "true" : "false");
+            if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+            o << "}";
+            emitAuto (eventBroker, "clip_clear", o.str());
+            return args.ok;
+        });
+
     // --- MIDI ---
 
     // daw.inject_midi(note, vel [, channel=1])
