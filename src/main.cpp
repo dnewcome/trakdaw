@@ -438,11 +438,15 @@ public:
     // Auto-emit: the engine itself publishes built-in events (transport,
     // clip_launch, follow, script_load, midi_in, osc_in). Scripts toggle
     // with daw.auto_emit(bool) / daw.auto_emit_midi_in(bool) /
-    // daw.auto_emit_osc_in(bool). midi_in and osc_in are off by default
-    // because they can be very chatty under load (drum machines, Tidal).
+    // daw.auto_emit_osc_in(bool).
+    //
+    // midi_in is off by default because MIDI clock alone is 96 msgs/beat;
+    // turning it on by default would flood the event log on most setups.
+    // OSC defaults on — typical OSC sources (Tidal, hardware controllers)
+    // emit a few messages per cycle, well within the log's capacity.
     std::atomic<bool> autoEmit{true};
     std::atomic<bool> autoEmitMidiIn{false};
-    std::atomic<bool> autoEmitOscIn{false};
+    std::atomic<bool> autoEmitOscIn{true};
 
 private:
     std::mutex                              mu;
