@@ -74,6 +74,10 @@ daw.clip(track, slot).stop()
 daw.clip(track, slot).playing()  -- bool
 daw.clip(track, slot).name       -- string
 
+-- Tracks
+daw.tracks()                                  -- list track names
+daw.add_track()                               -- add one; returns new index
+
 -- Plugins
 daw.load_4osc(track)                          -- Tracktion built-in synth
 daw.load_plugin(track, "/path/to/foo.vst3")   -- external VST3 (verified with Surge XT)

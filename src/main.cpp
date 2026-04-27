@@ -1241,6 +1241,37 @@ static void registerDawApi (sol::state& lua,
         return t;
     });
 
+    // daw.add_track() → 1-based index of the new track
+    // Adds one audio track with the same number of clip slots as existing
+    // tracks (or 2 if there are none), then rebuilds the audio graph so
+    // injectLiveMidiMessage and clip launching work immediately.
+    daw.set_function ("add_track", [&edit, &eventBroker]() -> int {
+        struct Args { te::Edit* edit; int newIdx; };
+        Args args { &edit, 0 };
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void* ctx) -> void* {
+                auto* a = static_cast<Args*> (ctx);
+                int slotsPerTrack = 2;
+                {
+                    auto existing = te::getAudioTracks (*a->edit);
+                    if (! existing.isEmpty())
+                        slotsPerTrack = existing[0]->getClipSlotList().getClipSlots().size();
+                    a->edit->ensureNumberOfAudioTracks (existing.size() + 1);
+                }
+                auto tracks = te::getAudioTracks (*a->edit);
+                a->newIdx = tracks.size();
+                tracks[a->newIdx - 1]->getClipSlotList().ensureNumberOfSlots (slotsPerTrack);
+                a->edit->getTransport().ensureContextAllocated (true);
+                return nullptr;
+            }, &args);
+
+        std::ostringstream o;
+        o << "{\"track\":" << args.newIdx << "}";
+        emitAuto (eventBroker, "track_add", o.str());
+        std::cout << "[track] added track " << args.newIdx << "\n" << std::flush;
+        return args.newIdx;
+    });
+
     // --- MIDI ---
 
     // daw.inject_midi(note, vel [, channel=1])
