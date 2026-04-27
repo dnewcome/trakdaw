@@ -15,8 +15,10 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
              display:flex; justify-content:space-between; align-items:center; }
   header .meta { color:#475569; font-size:11px; letter-spacing:1px; }
   main     { display:grid; grid-template-columns: 1fr 1fr;
-             grid-template-rows: auto 1fr; gap:16px; padding:16px;
+             grid-template-rows: auto fit-content(220px) 1fr;
+             gap:16px; padding:16px;
              height: calc(100vh - 46px); box-sizing: border-box; }
+  #tracks-panel { min-height: 0; }
   section  { background:#12151d; border:1px solid #1f2430; display:flex;
              flex-direction:column; min-height:0; overflow:hidden; }
   #grid-panel { grid-column: 1 / -1; }
