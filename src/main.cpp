@@ -1858,6 +1858,26 @@ static void registerDawApi (sol::state& lua,
                   << ", raw: " << rawCount << "\n" << std::flush;
     });
 
+    // daw.list_raw_midi_inputs() — what JUCE's MidiInput layer sees right
+    // now (uses ALSA seq on Linux). list_engine_midi_inputs() is the
+    // higher-level Tracktion view, which always includes a virtual
+    // "all_midi_in" aggregator regardless of hardware.
+    daw.set_function ("list_raw_midi_inputs", []() {
+        juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+            [](void*) -> void* {
+                auto devs = juce::MidiInput::getAvailableDevices();
+                if (devs.isEmpty())
+                {
+                    std::cout << "  (none)\n";
+                    return nullptr;
+                }
+                for (auto& d : devs)
+                    std::cout << "  " << d.name.toStdString()
+                              << "  [" << d.identifier.toStdString() << "]\n";
+                return nullptr;
+            }, nullptr);
+    });
+
     daw.set_function ("list_engine_midi_inputs", [&edit]() {
         juce::MessageManager::getInstance()->callFunctionOnMessageThread (
             [](void* ctx) -> void* {
@@ -3119,15 +3139,22 @@ public:
             [this]() -> int {
                 std::set<juce::String> open;
                 for (auto& mi : midiInputs) open.insert (mi->getIdentifier());
-                for (auto& info : juce::MidiInput::getAvailableDevices())
+                auto available = juce::MidiInput::getAvailableDevices();
+                std::cout << "[midi] available raw devices ("
+                          << available.size() << "):\n";
+                for (auto& info : available)
+                    std::cout << "  " << info.name.toStdString()
+                              << (open.count (info.identifier) ? "  (already open)" : "")
+                              << "\n";
+                for (auto& info : available)
                 {
                     if (open.count (info.identifier)) continue;
                     auto mi = juce::MidiInput::openDevice (info.identifier, midiHandler.get());
                     if (mi)
                     {
                         mi->start();
-                        std::cout << "[midi] opened (rescan): "
-                                  << info.name << "\n" << std::flush;
+                        std::cout << "[midi] opened: "
+                                  << info.name.toStdString() << "\n" << std::flush;
                         midiInputs.push_back (std::move (mi));
                     }
                 }

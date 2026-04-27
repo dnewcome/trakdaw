@@ -65,7 +65,7 @@ target_compile_definitions(trakdaw PRIVATE
     SOL_ALL_SAFETIES_ON=1
     JUCE_USE_WINRT_MIDI=0
     JUCE_JACK=1
-    JUCE_ALSA=0
+    JUCE_ALSA=1               # also gates Linux MIDI (juce_Midi_linux.cpp)
     JUCE_PULSEAUDIO=0)
 
 target_link_libraries(trakdaw PRIVATE
