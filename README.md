@@ -120,7 +120,8 @@ daw.osc_stop()
 daw.osc_port()                           -- → port or nil
 daw.osc_send(host, port, addr, ...)      -- e.g. daw.osc_send("127.0.0.1", 9000, "/foo", 1, 2.5)
 function on_osc(addr, args) ... end      -- callback per incoming message
-daw.auto_emit_osc_in(false)              -- gate (default on); turn off for high-rate OSC
+daw.auto_emit_midi_in(false)             -- default on; turn off if your gear sends MIDI clock
+daw.auto_emit_osc_in(false)              -- default on; turn off for high-rate OSC
 
 -- MIDI output to external devices
 daw.list_midi_outputs()

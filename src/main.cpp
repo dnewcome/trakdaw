@@ -440,12 +440,11 @@ public:
     // with daw.auto_emit(bool) / daw.auto_emit_midi_in(bool) /
     // daw.auto_emit_osc_in(bool).
     //
-    // midi_in is off by default because MIDI clock alone is 96 msgs/beat;
-    // turning it on by default would flood the event log on most setups.
-    // OSC defaults on — typical OSC sources (Tidal, hardware controllers)
-    // emit a few messages per cycle, well within the log's capacity.
+    // midi_in and osc_in default ON so traffic is visible in the event log
+    // out of the box. MIDI clock (24 ppqn × 4 = 96/beat) can flood the log
+    // — disable with daw.auto_emit_midi_in(false) if your gear sends clock.
     std::atomic<bool> autoEmit{true};
-    std::atomic<bool> autoEmitMidiIn{false};
+    std::atomic<bool> autoEmitMidiIn{true};
     std::atomic<bool> autoEmitOscIn{true};
 
 private:
@@ -934,6 +933,7 @@ static void registerDawApi (sol::state& lua,
                              Scheduler& scheduler,
                              WatchState& watch,
                              OscBridge& osc,
+                             std::function<int()>& rescanRawMidi,
                              std::function<void(const std::string&)> onWatch,
                              PythonHost& pythonHost)
 {
@@ -1834,25 +1834,28 @@ static void registerDawApi (sol::state& lua,
     // through both.
 
     // daw.list_engine_midi_inputs() — Tracktion's view of MIDI input devices
-    // daw.rescan_midi() — ask Tracktion to re-enumerate MIDI input/output
-    // devices. Useful when a keyboard or controller is plugged in after
-    // trakdaw started up; otherwise it won't show in list_engine_midi_inputs
-    // until next launch.
-    daw.set_function ("rescan_midi", [&edit, &eventBroker]() {
-        struct Args { te::Edit* edit; int count; };
+    // daw.rescan_midi() — re-enumerate MIDI devices on both the Tracktion
+    // side (so list_engine_midi_inputs / assign_midi_input pick up new
+    // devices) AND the raw juce::MidiInput side (so on_midi callbacks +
+    // midi_in events fire for the new devices). Without this, a keyboard
+    // plugged in after trakdaw startup is invisible to both paths.
+    daw.set_function ("rescan_midi", [&edit, &eventBroker, &rescanRawMidi]() {
+        struct Args { te::Edit* edit; int trackedCount; };
         Args args { &edit, 0 };
         juce::MessageManager::getInstance()->callFunctionOnMessageThread (
             [](void* ctx) -> void* {
                 auto* a = static_cast<Args*> (ctx);
                 a->edit->engine.getDeviceManager().rescanMidiDeviceList();
-                a->count = (int) a->edit->engine.getDeviceManager().getMidiInDevices().size();
+                a->trackedCount = (int) a->edit->engine.getDeviceManager().getMidiInDevices().size();
                 return nullptr;
             }, &args);
+        int rawCount = rescanRawMidi ? rescanRawMidi() : 0;
         std::ostringstream o;
-        o << "{\"midi_in_count\":" << args.count << "}";
+        o << "{\"engine_inputs\":" << args.trackedCount
+          << ",\"raw_inputs\":" << rawCount << "}";
         emitAuto (eventBroker, "midi_rescan", o.str());
-        std::cout << "[midi] rescanned — " << args.count
-                  << " input device(s) visible\n" << std::flush;
+        std::cout << "[midi] rescanned — engine: " << args.trackedCount
+                  << ", raw: " << rawCount << "\n" << std::flush;
     });
 
     daw.set_function ("list_engine_midi_inputs", [&edit]() {
@@ -2422,16 +2425,18 @@ class LuaRepl : private juce::Thread
 {
 public:
     LuaRepl (te::Edit& edit, MidiEventQueue& midiQueue,
-             EventBroker& eventBroker, PythonHost& pythonHost)
+             EventBroker& eventBroker, PythonHost& pythonHost,
+             std::function<int()> rescanRawMidi_)
         : juce::Thread ("lua-repl"), edit (edit), midiQueue (midiQueue),
-          eventBroker (eventBroker)
+          eventBroker (eventBroker),
+          rescanRawMidi (std::move (rescanRawMidi_))
     {
         lua.open_libraries (sol::lib::base, sol::lib::string,
                             sol::lib::table,  sol::lib::math,
                             sol::lib::io,     sol::lib::os);
 
         registerDawApi (lua, edit, midiQueue, midiOutput, pluginEditors,
-            eventBroker, scheduler, watch, osc,
+            eventBroker, scheduler, watch, osc, rescanRawMidi,
             [this](const std::string& path) {
                 watch.path  = path;
                 watch.mtime = juce::File (path).getLastModificationTime();
@@ -2822,6 +2827,7 @@ private:
     te::Edit&                          edit;
     MidiEventQueue&                    midiQueue;
     EventBroker&                       eventBroker;
+    std::function<int()>               rescanRawMidi;
     sol::state                         lua;
     Scheduler                          scheduler;
     bool                               replShouldExit = false;
@@ -3107,7 +3113,26 @@ public:
         eventBroker = std::make_unique<EventBroker>();
 
         // 8. Lua REPL
-        repl = std::make_unique<LuaRepl> (*edit, midiQueue, *eventBroker, *pythonHost);
+        repl = std::make_unique<LuaRepl> (*edit, midiQueue, *eventBroker, *pythonHost,
+            // Re-enumerate raw juce::MidiInput devices and open any new ones.
+            // Returns the total open count after the pass.
+            [this]() -> int {
+                std::set<juce::String> open;
+                for (auto& mi : midiInputs) open.insert (mi->getIdentifier());
+                for (auto& info : juce::MidiInput::getAvailableDevices())
+                {
+                    if (open.count (info.identifier)) continue;
+                    auto mi = juce::MidiInput::openDevice (info.identifier, midiHandler.get());
+                    if (mi)
+                    {
+                        mi->start();
+                        std::cout << "[midi] opened (rescan): "
+                                  << info.name << "\n" << std::flush;
+                        midiInputs.push_back (std::move (mi));
+                    }
+                }
+                return (int) midiInputs.size();
+            });
         repl->start();
 
         // 9. HTTP server (POST /eval, GET /events)
