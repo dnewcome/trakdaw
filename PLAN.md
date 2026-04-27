@@ -250,6 +250,7 @@ In addition to script-driven `daw.emit`, the engine publishes a fixed set of bui
 | `clip_create`      | `daw.create_clip(t, s, beats)`                | `{track, slot, beats, ok, error?}`         |
 | `clip_clear`       | `daw.clear_clip(t, s)`                        | `{track, slot, ok, error?}`                |
 | `reset`            | `daw.reset()`                                 | `{tracks, plugins_removed, clips_removed}` |
+| `unwatch`          | `daw.unwatch()`                               | `{path}`                                   |
 
 `daw.state()` returns a JSON string snapshot of bpm, transport, tracks, plugins, and clip slots — used by the web UI to render the tracks panel. Lua-as-query in practice: no fixed schema is hard-coded server-side beyond what the engine knows; if scripts add their own state, they can extend `daw.state()` from Lua or expose a different snapshot function entirely.
 

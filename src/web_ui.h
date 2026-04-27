@@ -84,7 +84,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
 <body>
 <header>
   <span>trakdaw</span>
-  <span class="meta"><span id="transport">stopped</span> · bpm <span id="bpm">—</span></span>
+  <span class="meta"><span id="transport">stopped</span> · bpm <span id="bpm">—</span><span id="watching"></span></span>
 </header>
 <main>
   <section id="grid-panel">
@@ -218,7 +218,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
     'plugin_load', 'plugin_editor', 'transport', 'bpm', 'track_add',
     'midi_input_route', 'patch', 'script_load',
     'clip_launch', 'clip_stop', 'follow',
-    'clip_create', 'clip_clear', 'reset',
+    'clip_create', 'clip_clear', 'reset', 'unwatch',
   ]);
 
   function connect() {
@@ -249,6 +249,15 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
       renderTracks(st);
       $('bpm').textContent = String(Math.round(st.bpm));
       $('transport').textContent = st.playing ? 'playing' : 'stopped';
+      const w = $('watching');
+      if (st.watching) {
+        const name = st.watching.replace(/^.*[\\/]/, '');
+        w.textContent = ' · watching ' + name;
+        w.title = st.watching;
+      } else {
+        w.textContent = '';
+        w.title = '';
+      }
       $('tracks-meta').textContent =
         st.tracks.length + ' tracks · bar ' + st.bar +
         ' · beat ' + st.beat.toFixed(2);

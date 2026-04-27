@@ -767,6 +767,17 @@ private:
     int                        nextId = 0;
 };
 
+// Hot-reload state for the (currently single) watched script. Owned by
+// LuaRepl, passed by reference to registerDawApi so daw.unwatch() and
+// daw.state() can read/clear it.
+struct WatchState
+{
+    std::string path;
+    juce::Time  mtime;
+    bool        pending   = false;
+    int         pollCount = 0;
+};
+
 // Look up the first plugin's automatable parameter on an AudioTrack by ID,
 // falling back to a case-insensitive match on the display name.
 static te::AutomatableParameter*
@@ -793,6 +804,7 @@ static void registerDawApi (sol::state& lua,
                              PluginEditorMap& pluginEditors,
                              EventBroker& eventBroker,
                              Scheduler& scheduler,
+                             WatchState& watch,
                              std::function<void(const std::string&)> onWatch,
                              PythonHost& pythonHost)
 {
@@ -1019,9 +1031,9 @@ static void registerDawApi (sol::state& lua,
     // and clip slots. Returned as a string so /eval round-trips it verbatim
     // and the browser can JSON.parse it directly. Lua-as-query: scripts can
     // also call this and emit/log subsets.
-    daw.set_function ("state", [&edit]() -> std::string {
-        struct Args { te::Edit* edit; std::string out; };
-        Args args { &edit, {} };
+    daw.set_function ("state", [&edit, &watch]() -> std::string {
+        struct Args { te::Edit* edit; std::string out; std::string watching; };
+        Args args { &edit, {}, watch.path };
         juce::MessageManager::getInstance()->callFunctionOnMessageThread (
             [](void* ctx) -> void* {
                 auto* a = static_cast<Args*> (ctx);
@@ -1054,7 +1066,10 @@ static void registerDawApi (sol::state& lua,
                   << ",\"position_beats\":" << a->edit->tempoSequence.toBeats (pos).inBeats()
                   << ",\"bar\":" << (bb.bars + 1)
                   << ",\"beat\":" << (bb.beats.inBeats() + 1.0)
-                  << ",\"tracks\":[";
+                  << ",\"watching\":";
+                if (a->watching.empty()) o << "null";
+                else                     o << "\"" << esc (a->watching) << "\"";
+                o << ",\"tracks\":[";
                 auto tracks = te::getAudioTracks (*a->edit);
                 for (int i = 0; i < (int) tracks.size(); ++i)
                 {
@@ -1760,6 +1775,30 @@ static void registerDawApi (sol::state& lua,
             return true;
         });
 
+    // daw.unwatch() — stop hot-reloading the currently watched script.
+    // The script's effects on the engine stay in place; only the file-mtime
+    // poll is cancelled.
+    daw.set_function ("unwatch", [&watch, &eventBroker]() {
+        if (watch.path.empty()) return false;
+        std::ostringstream o;
+        o << "{\"path\":\"" << watch.path << "\"}";
+        emitAuto (eventBroker, "unwatch", o.str());
+        std::cout << "[watch] stopped: "
+                  << juce::File (watch.path).getFileName() << "\n" << std::flush;
+        watch.path.clear();
+        watch.pending = false;
+        return true;
+    });
+
+    // daw.watching() → string path or nil
+    daw.set_function ("watching",
+        [&watch](sol::this_state ts) -> sol::object {
+            sol::state_view lv (ts);
+            return watch.path.empty()
+                ? sol::object (sol::lua_nil)
+                : sol::make_object (lv, watch.path);
+        });
+
     // --- persistent store ---
 
     // daw.store persists across hot reloads (the Lua state is not replaced).
@@ -2170,7 +2209,7 @@ public:
                             sol::lib::io,     sol::lib::os);
 
         registerDawApi (lua, edit, midiQueue, midiOutput, pluginEditors,
-            eventBroker, scheduler,
+            eventBroker, scheduler, watch,
             [this](const std::string& path) {
                 watch.path  = path;
                 watch.mtime = juce::File (path).getLastModificationTime();
@@ -2550,14 +2589,6 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    struct WatchState
-    {
-        std::string path;
-        juce::Time  mtime;
-        bool        pending   = false;
-        int         pollCount = 0;
-    };
-
     struct EvalRequest
     {
         std::string code;

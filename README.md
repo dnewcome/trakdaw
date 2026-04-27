@@ -95,6 +95,8 @@ daw.set_param(track, "filter1.cutoff", 0.7)   -- → bool
 
 -- Scripts
 daw.load_script("scripts/foo.lua")   -- load + watch for hot reload
+daw.unwatch()                        -- stop watching the current script
+daw.watching()                       -- → path being watched, or nil
 daw.run_python("scripts/foo.py")     -- run Python arrangement script
 
 -- Follow actions
