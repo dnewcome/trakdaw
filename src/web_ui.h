@@ -249,6 +249,17 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
       $('tracks-meta').textContent =
         st.tracks.length + ' tracks · bar ' + st.bar +
         ' · beat ' + st.beat.toFixed(2);
+
+      // Sync the clip grid's bounds to the authoritative state. The grid
+      // also auto-grows from individual clip events, but track_add doesn't
+      // emit a per-clip event, so without this the grid stays at 3 rows
+      // after daw.add_track().
+      const tcount = st.tracks.length;
+      const scount = (st.tracks[0] && st.tracks[0].clips.length) || grid.slots;
+      let grew = false;
+      if (tcount > grid.tracks) { grid.tracks = tcount; grew = true; }
+      if (scount > grid.slots)  { grid.slots  = scount; grew = true; }
+      if (grew) rebuildGrid();
     } catch (e) { /* server may not be ready yet on first paint */ }
   }
 
