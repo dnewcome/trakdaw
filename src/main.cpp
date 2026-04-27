@@ -1198,6 +1198,19 @@ static void registerDawApi (sol::state& lua,
                   << ",\"watching\":";
                 if (a->watching.empty()) o << "null";
                 else                     o << "\"" << esc (a->watching) << "\"";
+                o << ",\"audio\":";
+                if (auto* dev = a->edit->engine.getDeviceManager().deviceManager.getCurrentAudioDevice())
+                {
+                    const double sr  = dev->getCurrentSampleRate();
+                    const int    buf = dev->getCurrentBufferSizeSamples();
+                    o << "{\"device\":\"" << esc (dev->getName().toStdString()) << "\""
+                      << ",\"type\":\""    << esc (dev->getTypeName().toStdString()) << "\""
+                      << ",\"sample_rate\":" << sr
+                      << ",\"buffer_size\":" << buf
+                      << ",\"latency_ms\":" << (sr > 0 ? (buf / sr) * 1000.0 : 0.0)
+                      << "}";
+                }
+                else o << "null";
                 o << ",\"tracks\":[";
                 auto tracks = te::getAudioTracks (*a->edit);
                 for (int i = 0; i < (int) tracks.size(); ++i)
@@ -1254,23 +1267,39 @@ static void registerDawApi (sol::state& lua,
         return args.out;
     });
 
-    daw.set_function ("audio_info", [&edit]() {
+    daw.set_function ("audio_info", [&edit, &eventBroker]() {
         auto& dm  = edit.engine.getDeviceManager();
         auto* dev = dm.deviceManager.getCurrentAudioDevice();
+        std::ostringstream payload;
         if (dev)
         {
+            const double sr   = dev->getCurrentSampleRate();
+            const int    buf  = dev->getCurrentBufferSizeSamples();
+            const int    chs  = dev->getActiveOutputChannels().countNumberOfSetBits();
+            const double lat  = sr > 0 ? (buf / sr) * 1000.0 : 0.0;
+
             std::cout << "Audio device:  " << dev->getName() << "\n";
             std::cout << "Type:          " << dev->getTypeName() << "\n";
-            std::cout << "Sample rate:   " << dev->getCurrentSampleRate() << "\n";
-            std::cout << "Buffer size:   " << dev->getCurrentBufferSizeSamples() << "\n";
-            std::cout << "Out channels:  " << dev->getActiveOutputChannels().countNumberOfSetBits() << "\n";
+            std::cout << "Sample rate:   " << sr << "\n";
+            std::cout << "Buffer size:   " << buf << "\n";
+            std::cout << "Out channels:  " << chs << "\n";
+            std::cout << "Latency:       " << lat << " ms\n";
+
+            payload << "{\"device\":\"" << dev->getName().toStdString() << "\""
+                    << ",\"type\":\"" << dev->getTypeName().toStdString() << "\""
+                    << ",\"sample_rate\":" << sr
+                    << ",\"buffer_size\":" << buf
+                    << ",\"channels\":" << chs
+                    << ",\"latency_ms\":" << lat << "}";
         }
         else
         {
             std::cout << "No audio device open\n";
+            payload << "{\"device\":null}";
         }
         std::cout << "Transport:     " << (edit.getTransport().isPlaying() ? "playing" : "stopped") << "\n";
         std::cout << "Position:      " << edit.getTransport().getPosition().inSeconds() << "s\n";
+        emitAuto (eventBroker, "audio_info", payload.str());
     });
 
     // daw.bpm()       → read current BPM

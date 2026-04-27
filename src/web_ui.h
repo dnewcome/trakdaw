@@ -84,7 +84,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
 <body>
 <header>
   <span>trakdaw</span>
-  <span class="meta"><span id="transport">stopped</span> · bpm <span id="bpm">—</span><span id="watching"></span></span>
+  <span class="meta"><span id="transport">stopped</span> · bpm <span id="bpm">—</span><span id="audio"></span><span id="watching"></span></span>
 </header>
 <main>
   <section id="grid-panel">
@@ -219,6 +219,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
     'midi_input_route', 'patch', 'script_load',
     'clip_launch', 'clip_stop', 'follow',
     'clip_create', 'clip_clear', 'reset', 'unwatch',
+    'audio_device_open', 'audio_info',
   ]);
 
   function connect() {
@@ -249,6 +250,17 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
       renderTracks(st);
       $('bpm').textContent = String(Math.round(st.bpm));
       $('transport').textContent = st.playing ? 'playing' : 'stopped';
+      const aEl = $('audio');
+      if (st.audio) {
+        const a = st.audio;
+        aEl.textContent = ' · ' + a.type.toLowerCase()
+          + ' ' + (a.sample_rate / 1000) + 'k/' + a.buffer_size
+          + ' (' + a.latency_ms.toFixed(1) + 'ms)';
+        aEl.title = a.device;
+      } else {
+        aEl.textContent = ' · no audio device';
+        aEl.title = '';
+      }
       const w = $('watching');
       if (st.watching) {
         const name = st.watching.replace(/^.*[\\/]/, '');
