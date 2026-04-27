@@ -75,6 +75,7 @@ target_link_libraries(trakdaw PRIVATE
     juce::juce_audio_devices
     juce::juce_audio_processors
     juce::juce_audio_utils
+    juce::juce_osc
     ${LUAJIT_LIBRARIES}
     pybind11::embed)
 

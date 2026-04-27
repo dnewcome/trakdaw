@@ -108,6 +108,14 @@ daw.inject_midi(note, velocity [, channel])    -- fires Lua on_midi callback
 daw.note_on(track, note, velocity [, channel]) -- play instrument on track
 daw.note_off(track, note [, channel])          -- stop instrument note
 
+-- OSC
+daw.osc_listen(57120)                    -- bind UDP port; returns true on success
+daw.osc_stop()
+daw.osc_port()                           -- → port or nil
+daw.osc_send(host, port, addr, ...)      -- e.g. daw.osc_send("127.0.0.1", 9000, "/foo", 1, 2.5)
+function on_osc(addr, args) ... end      -- callback per incoming message
+daw.auto_emit_osc_in(true)               -- gate for emitting osc_in events (off by default)
+
 -- MIDI output to external devices
 daw.list_midi_outputs()
 daw.open_midi_output(name)

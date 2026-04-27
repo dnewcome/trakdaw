@@ -436,15 +436,84 @@ public:
     }
 
     // Auto-emit: the engine itself publishes built-in events (transport,
-    // clip_launch, follow, script_load, midi_in). Scripts toggle with
-    // daw.auto_emit(bool) / daw.auto_emit_midi_in(bool). midi_in is off by
-    // default because it can be very chatty.
+    // clip_launch, follow, script_load, midi_in, osc_in). Scripts toggle
+    // with daw.auto_emit(bool) / daw.auto_emit_midi_in(bool) /
+    // daw.auto_emit_osc_in(bool). midi_in and osc_in are off by default
+    // because they can be very chatty under load (drum machines, Tidal).
     std::atomic<bool> autoEmit{true};
     std::atomic<bool> autoEmitMidiIn{false};
+    std::atomic<bool> autoEmitOscIn{false};
 
 private:
     std::mutex                              mu;
     std::vector<std::weak_ptr<Subscriber>>  subs;
+};
+
+//==============================================================================
+// OscBridge — owns a juce::OSCReceiver, queues incoming messages for
+// the REPL thread to drain. Uses RealtimeCallback so we don't compete
+// for the message thread; queueing is mutex-protected (OSC traffic is
+// low-rate, no need for lock-free).
+//==============================================================================
+class OscBridge : private juce::OSCReceiver::Listener<juce::OSCReceiver::RealtimeCallback>
+{
+public:
+    bool listen (int port)
+    {
+        stop();
+        if (! receiver.connect (port))
+            return false;
+        receiver.addListener (this);
+        listenPort = port;
+        return true;
+    }
+
+    void stop()
+    {
+        receiver.removeListener (this);
+        receiver.disconnect();
+        listenPort = -1;
+    }
+
+    int getListenPort() const noexcept { return listenPort; }
+
+    std::vector<juce::OSCMessage> drain()
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        std::vector<juce::OSCMessage> out;
+        std::swap (out, queue);
+        return out;
+    }
+
+    bool send (const std::string& host, int port,
+               const juce::OSCMessage& msg)
+    {
+        juce::OSCSender sender;
+        if (! sender.connect (juce::String (host), port)) return false;
+        return sender.send (msg);
+    }
+
+private:
+    void oscMessageReceived (const juce::OSCMessage& msg) override
+    {
+        std::lock_guard<std::mutex> lock (mu);
+        if (queue.size() < 1024)
+            queue.push_back (msg);
+    }
+
+    void oscBundleReceived (const juce::OSCBundle& b) override
+    {
+        for (auto& el : b)
+            if (el.isMessage())
+                oscMessageReceived (el.getMessage());
+            else if (el.isBundle())
+                oscBundleReceived (el.getBundle());
+    }
+
+    juce::OSCReceiver              receiver;
+    std::mutex                     mu;
+    std::vector<juce::OSCMessage>  queue;
+    int                            listenPort = -1;
 };
 
 // Helper: emit a built-in event if auto-emit is on.
@@ -517,6 +586,61 @@ static void dispatchMidiToLua (sol::state& lua, const MidiEvent& e,
     {
         sol::error err = result;
         std::cerr << "\n[on_midi error] " << err.what() << "\n" << std::flush;
+    }
+}
+
+// Forward decl — defined below; needed by dispatchOscToLua for the osc_in
+// auto-emit JSON serialization.
+static void luaToJson (std::ostringstream& out, sol::object obj, int depth);
+
+//==============================================================================
+// Drain queued OSC messages and dispatch on_osc(address, args). Lua-thread
+// only. Also emits an osc_in event per message when autoEmitOscIn is on.
+//==============================================================================
+static void dispatchOscToLua (sol::state& lua, OscBridge& osc, EventBroker& broker)
+{
+    auto msgs = osc.drain();
+    if (msgs.empty()) return;
+
+    sol::object cb = lua["on_osc"];
+    const bool hasCallback = (cb.get_type() == sol::type::function);
+
+    for (auto& msg : msgs)
+    {
+        const std::string addr = msg.getAddressPattern().toString().toStdString();
+
+        // Build a numeric-indexed Lua table of args.
+        sol::table args = lua.create_table();
+        for (int i = 0; i < msg.size(); ++i)
+        {
+            const auto& a = msg[i];
+            if      (a.isInt32())   args[i + 1] = a.getInt32();
+            else if (a.isFloat32()) args[i + 1] = (double) a.getFloat32();
+            else if (a.isString())  args[i + 1] = a.getString().toStdString();
+            else                    args[i + 1] = sol::lua_nil;
+        }
+
+        if (broker.autoEmitOscIn.load() && broker.autoEmit.load())
+        {
+            std::ostringstream o;
+            o << "{\"address\":\"";
+            for (unsigned char c : addr)
+                if (c == '"' || c == '\\') { o << '\\'; o << (char) c; }
+                else                       { o << (char) c; }
+            o << "\",\"args\":";
+            luaToJson (o, args, 0);
+            o << "}";
+            broker.emit ("{\"name\":\"osc_in\",\"data\":" + o.str() + "}");
+        }
+
+        if (! hasCallback) continue;
+
+        auto result = cb.as<sol::protected_function>() (addr, args);
+        if (! result.valid())
+        {
+            sol::error err = result;
+            std::cerr << "\n[on_osc error] " << err.what() << "\n" << std::flush;
+        }
     }
 }
 
@@ -805,6 +929,7 @@ static void registerDawApi (sol::state& lua,
                              EventBroker& eventBroker,
                              Scheduler& scheduler,
                              WatchState& watch,
+                             OscBridge& osc,
                              std::function<void(const std::string&)> onWatch,
                              PythonHost& pythonHost)
 {
@@ -1600,6 +1725,78 @@ static void registerDawApi (sol::state& lua,
         [&eventBroker](bool on) { eventBroker.autoEmit.store (on); });
     daw.set_function ("auto_emit_midi_in",
         [&eventBroker](bool on) { eventBroker.autoEmitMidiIn.store (on); });
+    daw.set_function ("auto_emit_osc_in",
+        [&eventBroker](bool on) { eventBroker.autoEmitOscIn.store (on); });
+
+    // --- OSC ---
+    //
+    //   daw.osc_listen(57120)             -- bind UDP, returns true on success
+    //   daw.osc_stop()                    -- stop listening
+    //   daw.osc_port()                    -- → port number, or nil if not listening
+    //   function on_osc(addr, args) end   -- script-side callback per message
+    //   daw.osc_send(host, port, addr, ...)  -- send a message
+    //
+    // args is a Lua array of int / float / string. ints map to OSC int32,
+    // numbers with fractional parts to float32, strings to OSC string.
+    // Other Lua types are skipped.
+
+    daw.set_function ("osc_listen",
+        [&osc, &eventBroker](int port) -> bool {
+            bool ok = osc.listen (port);
+            std::ostringstream o;
+            o << "{\"port\":" << port << ",\"action\":\"listen\""
+              << ",\"ok\":" << (ok ? "true" : "false") << "}";
+            emitAuto (eventBroker, "osc", o.str());
+            std::cout << (ok ? "[osc] listening on " : "[osc] failed to bind ")
+                      << port << "\n" << std::flush;
+            return ok;
+        });
+
+    daw.set_function ("osc_stop", [&osc, &eventBroker]() {
+        int port = osc.getListenPort();
+        osc.stop();
+        std::ostringstream o;
+        o << "{\"port\":" << port << ",\"action\":\"stop\"}";
+        emitAuto (eventBroker, "osc", o.str());
+    });
+
+    daw.set_function ("osc_port",
+        [&osc](sol::this_state ts) -> sol::object {
+            sol::state_view lv (ts);
+            int p = osc.getListenPort();
+            return p > 0 ? sol::make_object (lv, p) : sol::object (sol::lua_nil);
+        });
+
+    daw.set_function ("osc_send",
+        [&osc](const std::string& host, int port,
+               const std::string& address,
+               sol::variadic_args vargs) -> bool {
+            juce::OSCMessage msg { juce::OSCAddressPattern (juce::String (address)) };
+            for (auto a : vargs)
+            {
+                sol::object obj = a;
+                switch (obj.get_type())
+                {
+                    case sol::type::number:
+                    {
+                        double d = obj.as<double>();
+                        if (d == (double) (int) d)
+                            msg.addInt32 ((juce::int32) d);
+                        else
+                            msg.addFloat32 ((float) d);
+                        break;
+                    }
+                    case sol::type::string:
+                        msg.addString (juce::String (obj.as<std::string>()));
+                        break;
+                    case sol::type::boolean:
+                        msg.addInt32 (obj.as<bool>() ? 1 : 0);
+                        break;
+                    default: break;   // skip nil / table / etc.
+                }
+            }
+            return osc.send (host, port, msg);
+        });
 
     // --- scheduler ---
     // daw.after(beats, fn)     — fire once after `beats` from now
@@ -2209,7 +2406,7 @@ public:
                             sol::lib::io,     sol::lib::os);
 
         registerDawApi (lua, edit, midiQueue, midiOutput, pluginEditors,
-            eventBroker, scheduler, watch,
+            eventBroker, scheduler, watch, osc,
             [this](const std::string& path) {
                 watch.path  = path;
                 watch.mtime = juce::File (path).getLastModificationTime();
@@ -2225,6 +2422,7 @@ public:
     {
         signalThreadShouldExit();
         stopThread (2000);
+        osc.stop();
         // Plugin editor windows own live VST editor components — they must
         // be destroyed on the message thread before the plugins themselves.
         juce::MessageManager::getInstance()->callFunctionOnMessageThread (
@@ -2503,6 +2701,7 @@ private:
             }
 
             drainMidi();
+            dispatchOscToLua (lua, osc, eventBroker);
             drainEvalQueue();
             checkFileForChanges();
             reloadIfReady();
@@ -2602,6 +2801,7 @@ private:
     Scheduler                          scheduler;
     bool                               replShouldExit = false;
     WatchState                         watch;
+    OscBridge                          osc;
     std::unique_ptr<juce::MidiOutput>  midiOutput;
     PluginEditorMap                    pluginEditors;
     std::map<std::pair<int,int>, FollowState> followStates;
