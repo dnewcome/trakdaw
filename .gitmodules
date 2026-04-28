@@ -7,3 +7,6 @@
 [submodule "vendor/sol2"]
 	path = vendor/sol2
 	url = https://github.com/ThePhD/sol2.git
+[submodule "vendor/isocline"]
+	path = vendor/isocline
+	url = https://github.com/daanx/isocline.git

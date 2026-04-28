@@ -36,8 +36,7 @@ namespace py = pybind11;
 // collide with anything JUCE pulls in via X11/Cocoa headers.
 #include <httplib.h>
 
-#include <readline/readline.h>
-#include <readline/history.h>
+#include <isocline.h>
 
 #include "web_ui.h"
 
@@ -2453,19 +2452,11 @@ static void registerDawApi (sol::state& lua,
     });
 }
 
-// readline's callback API requires C-style free functions, so we set this
-// to point at the live LuaRepl just before installing the handler.
-class LuaRepl;
-static LuaRepl* s_replForReadline = nullptr;
-
-static juce::String readlineHistoryPath()
+static juce::String replHistoryPath()
 {
     return juce::File::getSpecialLocation (juce::File::userHomeDirectory)
                 .getChildFile (".trakdaw_history").getFullPathName();
 }
-
-// readline calls this when a complete line is ready. line == nullptr means EOF.
-static void readlineLineCallback (char* line);  // forward; defined after LuaRepl
 
 //==============================================================================
 // LuaRepl
@@ -2524,10 +2515,7 @@ public:
             return;
         }
         if (! line.empty())
-        {
-            add_history (line.c_str());
-            evalLine (line);
-        }
+            evalLine (line);   // isocline auto-adds to history on read
     }
 
     void onReplEof()    // Ctrl+D
@@ -2733,7 +2721,7 @@ private:
     // -----------------------------------------------------------------------
     void run() override
     {
-        std::cout << "\ntrakdaw Lua REPL — readline + history (up arrow recalls)\n";
+        std::cout << "\ntrakdaw Lua REPL — isocline (history, line edit, multi-line)\n";
         std::cout << "  daw.play() / daw.stop()              transport\n";
         std::cout << "  daw.clip(t,s).launch()               launch clip (1-based)\n";
         std::cout << "  daw.note_on(t, note, vel)            play instrument on track t\n";
@@ -2742,42 +2730,52 @@ private:
         std::cout << "  http://127.0.0.1:8081/               web UI\n";
         std::cout << "  quit / exit / Ctrl+D\n\n";
 
-        // readline takes over stdin: history + line editing + reverse search.
-        // Don't let it install signal handlers — JUCE's SIGINT handler should
-        // win so Ctrl+C quits the app cleanly.
-        rl_catch_signals = 0;
-        rl_catch_sigwinch = 0;
+        // isocline runs on its own thread (it blocks on read()). The reader
+        // pushes completed lines onto a thread-safe queue; this poll loop
+        // drains the queue alongside MIDI / scheduler / etc. Avoids the
+        // earlier select-on-stdin gymnastics and is portable to Windows.
+        ic_init (false);
+        const auto histPath = replHistoryPath();
+        ic_set_history (histPath.toRawUTF8(), 1000);
 
-        const auto histPath = readlineHistoryPath();
-        read_history (histPath.toRawUTF8());            // best-effort; fine if missing
-        stifle_history (1000);
+        std::thread reader ([this] {
+            while (true)
+            {
+                char* line = ic_readline ("");
+                if (line == nullptr)         // Ctrl+D / EOF
+                {
+                    std::lock_guard<std::mutex> lk (replInputMutex);
+                    replEofSeen = true;
+                    break;
+                }
+                std::string s (line);
+                free (line);
+                std::lock_guard<std::mutex> lk (replInputMutex);
+                replInputQueue.push_back (std::move (s));
+            }
+        });
+        reader.detach();
 
-        s_replForReadline = this;
-        rl_callback_handler_install ("> ", &readlineLineCallback);
+        std::cout << "> " << std::flush;
 
         while (! threadShouldExit() && ! replShouldExit)
         {
-            fd_set fds;
-            FD_ZERO (&fds);
-            FD_SET (STDIN_FILENO, &fds);
-            struct timeval tv { 0, 10'000 };   // 10ms
-
-            int ready = ::select (STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
-
-            if (ready < 0 && errno == EINTR)
-                continue;
-
-            // Feed every available byte to readline. Each call may complete
-            // a line and invoke our callback (which evaluates it). Pasted
-            // multi-line blocks fall out of this loop naturally — readline
-            // sees the whole buffer and fires the callback once per newline.
-            while (ready > 0)
+            // Drain any lines the reader thread queued up while we were
+            // ticking the engine.
+            std::deque<std::string> lines;
+            bool eof = false;
             {
-                rl_callback_read_char();
-                FD_ZERO (&fds); FD_SET (STDIN_FILENO, &fds);
-                struct timeval zero { 0, 0 };
-                ready = ::select (STDIN_FILENO + 1, &fds, nullptr, nullptr, &zero);
+                std::lock_guard<std::mutex> lk (replInputMutex);
+                std::swap (lines, replInputQueue);
+                eof = replEofSeen;
             }
+            for (auto& line : lines)
+            {
+                onReplLine (line);
+                if (replShouldExit) break;
+                std::cout << "> " << std::flush;
+            }
+            if (eof) { onReplEof(); break; }
 
             drainMidi();
             dispatchOscToLua (lua, osc, eventBroker);
@@ -2786,11 +2784,9 @@ private:
             reloadIfReady();
             checkFollowActions();
             scheduler.tick();
-        }
 
-        rl_callback_handler_remove();
-        write_history (histPath.toRawUTF8());
-        s_replForReadline = nullptr;
+            wait (10);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2880,6 +2876,9 @@ private:
     sol::state                         lua;
     Scheduler                          scheduler;
     bool                               replShouldExit = false;
+    bool                               replEofSeen    = false;
+    std::mutex                         replInputMutex;
+    std::deque<std::string>            replInputQueue;
     WatchState                         watch;
     OscBridge                          osc;
     std::unique_ptr<juce::MidiOutput>  midiOutput;
@@ -2888,21 +2887,6 @@ private:
     std::mutex                         evalMutex;
     std::queue<EvalRequest>            evalQueue;
 };
-
-// Defined here (after LuaRepl is complete) because the callback dispatches
-// onto a LuaRepl method.
-static void readlineLineCallback (char* line)
-{
-    if (s_replForReadline == nullptr) { if (line) free (line); return; }
-    if (line == nullptr)
-    {
-        s_replForReadline->onReplEof();
-        return;
-    }
-    std::string s (line);
-    free (line);
-    s_replForReadline->onReplLine (s);
-}
 
 //==============================================================================
 // HttpServer — exposes POST /eval which runs a Lua chunk on the REPL thread

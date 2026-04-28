@@ -85,11 +85,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(trakdaw PRIVATE "-latomic" ${JACK_LIBRARIES})
 endif()
 
-# GNU readline for the stdin REPL (history, line editing, reverse search).
-# POSIX-only for now; Windows portability tracked in #1.
-if(NOT WIN32)
-    find_path(READLINE_INCLUDE_DIR readline/readline.h REQUIRED)
-    find_library(READLINE_LIBRARY readline REQUIRED)
-    target_include_directories(trakdaw PRIVATE ${READLINE_INCLUDE_DIR})
-    target_link_libraries(trakdaw PRIVATE ${READLINE_LIBRARY})
-endif()
+# Vendored line editor (history, multi-line, completion, syntax highlighting).
+# Single-file amalgamation — builds on Linux, macOS, and Windows with no
+# system dep. Replaces GNU readline; closes the cross-platform-REPL part of #1.
+target_sources(trakdaw PRIVATE vendor/isocline/src/isocline.c)
+target_include_directories(trakdaw PRIVATE vendor/isocline/include)

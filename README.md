@@ -36,6 +36,7 @@ Most DAWs bolt scripting on as an afterthought. trakdaw is built from the engine
 - Tracktion Engine (submodule: `vendor/tracktion_engine`)
 - LuaJIT (`pkg-config luajit`)
 - sol2 3.3.0 (submodule: `vendor/sol2`)
+- isocline (vendored at `vendor/isocline/`, MIT) — REPL line editing + history
 - Python 3.12 via pyenv (`~/.pyenv/versions/3.12.9`)
 - pybind11 (installed via pip in pyenv Python)
 - JACK (`pkg-config jack`) — for PipeWire audio on Linux
