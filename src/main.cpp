@@ -2200,7 +2200,10 @@ static void registerDawApi (sol::state& lua,
     // VST3 hosts, export a .vstpreset instead (separate function, TBD).
 
     daw.set_function ("save_patch",
-        [&edit, &eventBroker](int trackIdx, const std::string& path) -> bool {
+        [&edit, &eventBroker](int trackIdx, sol::optional<std::string> pathOpt) -> bool {
+            std::string path = pathOpt.value_or (std::string{});
+            if (path.empty())
+                path = "patches/track" + std::to_string (trackIdx) + ".xml";
             struct Args { te::Edit* edit; int idx; std::string path;
                           bool ok; std::string err; int count; };
             Args args { &edit, trackIdx, path, false, {}, 0 };
@@ -2246,7 +2249,10 @@ static void registerDawApi (sol::state& lua,
         });
 
     daw.set_function ("load_patch",
-        [&edit, &eventBroker](int trackIdx, const std::string& path) -> bool {
+        [&edit, &eventBroker](int trackIdx, sol::optional<std::string> pathOpt) -> bool {
+            std::string path = pathOpt.value_or (std::string{});
+            if (path.empty())
+                path = "patches/track" + std::to_string (trackIdx) + ".xml";
             struct Args { te::Edit* edit; int idx; std::string path;
                           bool ok; std::string err; int count; };
             Args args { &edit, trackIdx, path, false, {}, 0 };
