@@ -90,6 +90,10 @@ daw.load_4osc(track)                          -- Tracktion built-in synth
 daw.load_plugin(track, "/path/to/foo.vst3")   -- external VST3 (verified with Surge XT)
 daw.save_patch(track [, path])                -- save plugin chain; defaults to patches/trackN.xml
 daw.load_patch(track [, path])                -- restore plugin chain (replaces existing)
+
+-- Whole-session save/load — bpm, every track's plugins, every clip with notes
+daw.save_session([path])                      -- defaults to sessions/session.xml
+daw.load_session([path])                      -- replaces current state
 daw.list_params(track [, filter [, max=50]])  -- print id, name, value, range; filter is substring
 daw.get_param(track, "filter1.cutoff")        -- → number, or nil if not found
 daw.set_param(track, "filter1.cutoff", 0.7)   -- → bool

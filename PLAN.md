@@ -254,6 +254,7 @@ In addition to script-driven `daw.emit`, the engine publishes a fixed set of bui
 | `osc`              | `daw.osc_listen(p)` / `daw.osc_stop()`        | `{port, action, ok?}`                      |
 | `osc_in`           | Any incoming OSC message (gated, default off) | `{address, args}`                          |
 | `audio_info`       | `daw.audio_info()`                            | `{device, type, sample_rate, buffer_size, channels, latency_ms}` |
+| `session`          | `daw.save_session()` / `daw.load_session()`   | `{path, tracks, plugins, clips, notes, action, ok, error?}` |
 
 `daw.state()` returns a JSON string snapshot of bpm, transport, tracks, plugins, and clip slots — used by the web UI to render the tracks panel. Lua-as-query in practice: no fixed schema is hard-coded server-side beyond what the engine knows; if scripts add their own state, they can extend `daw.state()` from Lua or expose a different snapshot function entirely.
 

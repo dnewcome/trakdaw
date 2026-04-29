@@ -2315,6 +2315,220 @@ static void registerDawApi (sol::state& lua,
             return args.ok;
         });
 
+    // --- whole-session save / load ---
+    //
+    // Captures: BPM, watched-script path, every track's plugin chain (via
+    // the same pluginList ValueTree save_patch uses), and every MIDI clip
+    // in every slot with its notes. Format is a single XML file. Round-trips
+    // within trakdaw — not interchangeable with .tracktionedit.
+    //
+    // Skipped on purpose: scheduler tasks, on_end / on_midi callbacks
+    // (they're code, not data), daw.store, OSC port, MIDI input routing.
+    // Add those manually after load if you need them.
+
+    daw.set_function ("save_session",
+        [&edit, &eventBroker, &watch](sol::optional<std::string> pathOpt) -> bool {
+            std::string path = pathOpt.value_or (std::string{});
+            if (path.empty()) path = "sessions/session.xml";
+
+            struct Args { te::Edit* edit; std::string watchPath; std::string path;
+                          bool ok; std::string err;
+                          int trackCount; int pluginCount; int clipCount; int noteCount; };
+            Args args { &edit, watch.path, path, false, {}, 0, 0, 0, 0 };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    juce::ValueTree session ("TRAKDAW_SESSION");
+                    session.setProperty ("version", 1, nullptr);
+                    session.setProperty ("bpm",
+                        a->edit->tempoSequence.getTempo (0)->getBpm(), nullptr);
+                    if (! a->watchPath.empty())
+                        session.setProperty ("watching", juce::String (a->watchPath), nullptr);
+
+                    for (auto* at : te::getAudioTracks (*a->edit))
+                    {
+                        ++a->trackCount;
+                        juce::ValueTree trackNode ("TRACK");
+                        trackNode.setProperty ("name", at->getName(), nullptr);
+
+                        for (auto* plug : at->pluginList)
+                            plug->flushPluginStateToValueTree();
+                        a->pluginCount += at->pluginList.size();
+                        trackNode.appendChild (at->pluginList.state.createCopy(), nullptr);
+
+                        juce::ValueTree clips ("CLIPS");
+                        auto slots = at->getClipSlotList().getClipSlots();
+                        for (int s = 0; s < (int) slots.size(); ++s)
+                        {
+                            auto* clip = dynamic_cast<te::MidiClip*> (slots[s]->getClip());
+                            if (! clip) continue;
+                            ++a->clipCount;
+                            juce::ValueTree clipNode ("CLIP");
+                            clipNode.setProperty ("slot", s + 1, nullptr);
+                            clipNode.setProperty ("name", clip->getName(), nullptr);
+                            clipNode.setProperty ("length_beats",
+                                (clip->getEndBeat() - clip->getStartBeat()).inBeats(), nullptr);
+                            for (auto* note : clip->getSequence().getNotes())
+                            {
+                                ++a->noteCount;
+                                juce::ValueTree n ("NOTE");
+                                n.setProperty ("pitch",   note->getNoteNumber(), nullptr);
+                                n.setProperty ("start",   note->getStartBeat().inBeats(), nullptr);
+                                n.setProperty ("length",  note->getLengthBeats().inBeats(), nullptr);
+                                n.setProperty ("vel",     note->getVelocity(), nullptr);
+                                clipNode.appendChild (n, nullptr);
+                            }
+                            clips.appendChild (clipNode, nullptr);
+                        }
+                        trackNode.appendChild (clips, nullptr);
+                        session.appendChild (trackNode, nullptr);
+                    }
+
+                    juce::File file (a->path);
+                    file.getParentDirectory().createDirectory();
+                    if (! file.replaceWithText (session.toXmlString()))
+                        { a->err = "failed to write file"; return nullptr; }
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            std::ostringstream o;
+            o << "{\"path\":\"" << path << "\""
+              << ",\"tracks\":" << args.trackCount
+              << ",\"plugins\":" << args.pluginCount
+              << ",\"clips\":" << args.clipCount
+              << ",\"notes\":" << args.noteCount
+              << ",\"action\":\"save\",\"ok\":" << (args.ok ? "true" : "false");
+            if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+            o << "}";
+            emitAuto (eventBroker, "session", o.str());
+
+            if (args.ok)
+                std::cout << "[save_session] " << args.trackCount << " tracks, "
+                          << args.pluginCount << " plugins, "
+                          << args.clipCount << " clips, "
+                          << args.noteCount << " notes → " << path << "\n" << std::flush;
+            else
+                std::cerr << "[save_session error] " << args.err << "\n" << std::flush;
+            return args.ok;
+        });
+
+    daw.set_function ("load_session",
+        [&edit, &eventBroker, &pluginEditors, &scheduler]
+        (sol::this_state ts, sol::optional<std::string> pathOpt) -> bool {
+            std::string path = pathOpt.value_or (std::string{});
+            if (path.empty()) path = "sessions/session.xml";
+
+            // Wipe Lua-side state that would dangle after engine reset.
+            scheduler.clear();
+            sol::state_view lv (ts);
+            lv["daw"]["_follow"] = lv.create_table();
+
+            struct Args { te::Edit* edit; PluginEditorMap* wins; std::string path;
+                          bool ok; std::string err;
+                          int trackCount; int pluginCount; int clipCount; int noteCount; };
+            Args args { &edit, &pluginEditors, path, false, {}, 0, 0, 0, 0 };
+
+            juce::MessageManager::getInstance()->callFunctionOnMessageThread (
+                [](void* ctx) -> void* {
+                    auto* a = static_cast<Args*> (ctx);
+                    juce::File file (a->path);
+                    if (! file.existsAsFile())
+                        { a->err = "file not found: " + a->path; return nullptr; }
+                    auto xml = juce::parseXML (file);
+                    if (! xml) { a->err = "could not parse XML"; return nullptr; }
+                    auto state = juce::ValueTree::fromXml (*xml);
+                    if (! state.isValid() || state.getType().toString() != "TRAKDAW_SESSION")
+                        { a->err = "not a trakdaw session"; return nullptr; }
+
+                    // Wipe current engine state (mirrors daw.reset).
+                    a->edit->getTransport().stop (false, false);
+                    a->wins->clear();
+                    for (auto* at : te::getAudioTracks (*a->edit))
+                    {
+                        at->pluginList.clear();
+                        for (auto* slot : at->getClipSlotList().getClipSlots())
+                            if (auto* clip = slot->getClip())
+                                clip->removeFromParent();
+                    }
+
+                    if (state.hasProperty ("bpm"))
+                        a->edit->tempoSequence.getTempo (0)->setBpm (
+                            (double) state["bpm"]);
+
+                    // Make sure we have at least as many tracks as the file.
+                    int needed = state.getNumChildren();
+                    a->edit->ensureNumberOfAudioTracks (juce::jmax (needed, 1));
+                    auto tracks = te::getAudioTracks (*a->edit);
+
+                    int idx = 0;
+                    for (auto trackNode : state)
+                    {
+                        if (idx >= (int) tracks.size()) break;
+                        auto* at = tracks[idx++];
+                        ++a->trackCount;
+
+                        if (auto plugins = trackNode.getChildWithName ("PLUGINS");
+                            plugins.isValid())
+                        {
+                            at->pluginList.addPluginsFrom (plugins, true, true);
+                            a->pluginCount += at->pluginList.size();
+                        }
+
+                        auto clipsNode = trackNode.getChildWithName ("CLIPS");
+                        if (! clipsNode.isValid()) continue;
+                        auto slots = at->getClipSlotList().getClipSlots();
+                        for (auto clipNode : clipsNode)
+                        {
+                            int slot   = (int) clipNode.getProperty ("slot", 1);
+                            double len = (double) clipNode.getProperty ("length_beats", 4.0);
+                            if (slot < 1 || slot > (int) slots.size()) continue;
+                            auto endTime = a->edit->tempoSequence.toTime (
+                                te::BeatPosition::fromBeats (len));
+                            auto clip = te::insertMIDIClip (*slots[slot - 1],
+                                te::TimeRange { te::TimePosition{}, endTime });
+                            if (! clip) continue;
+                            ++a->clipCount;
+                            for (auto noteNode : clipNode)
+                            {
+                                if (noteNode.getType().toString() != "NOTE") continue;
+                                clip->getSequence().addNote (
+                                    (int) noteNode.getProperty ("pitch", 60),
+                                    te::BeatPosition::fromBeats ((double) noteNode.getProperty ("start", 0.0)),
+                                    te::BeatDuration::fromBeats ((double) noteNode.getProperty ("length", 1.0)),
+                                    (int) noteNode.getProperty ("vel", 100),
+                                    0, nullptr);
+                                ++a->noteCount;
+                            }
+                        }
+                    }
+                    a->edit->getTransport().ensureContextAllocated (true);
+                    a->ok = true;
+                    return nullptr;
+                }, &args);
+
+            std::ostringstream o;
+            o << "{\"path\":\"" << path << "\""
+              << ",\"tracks\":" << args.trackCount
+              << ",\"plugins\":" << args.pluginCount
+              << ",\"clips\":" << args.clipCount
+              << ",\"notes\":" << args.noteCount
+              << ",\"action\":\"load\",\"ok\":" << (args.ok ? "true" : "false");
+            if (! args.ok) o << ",\"error\":\"" << args.err << "\"";
+            o << "}";
+            emitAuto (eventBroker, "session", o.str());
+
+            if (args.ok)
+                std::cout << "[load_session] " << args.trackCount << " tracks, "
+                          << args.pluginCount << " plugins, "
+                          << args.clipCount << " clips, "
+                          << args.noteCount << " notes ← " << path << "\n" << std::flush;
+            else
+                std::cerr << "[load_session error] " << args.err << "\n" << std::flush;
+            return args.ok;
+        });
+
     // --- plugin parameters ---
     //
     // Lookup is by paramID first (e.g. "filter1.cutoff"), falling back to

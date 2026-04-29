@@ -219,7 +219,7 @@ static constexpr const char* kIndexHtml = R"HTML(<!doctype html>
     'midi_input_route', 'patch', 'script_load',
     'clip_launch', 'clip_stop', 'follow',
     'clip_create', 'clip_clear', 'reset', 'unwatch',
-    'audio_device_open', 'audio_info',
+    'audio_device_open', 'audio_info', 'session',
   ]);
 
   function connect() {
