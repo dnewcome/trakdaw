@@ -19,8 +19,10 @@ namespace py = pybind11;
 
 #include <JuceHeader.h>
 
+#ifndef _WIN32
 #include <sys/select.h>
 #include <unistd.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
@@ -249,14 +251,14 @@ PYBIND11_EMBEDDED_MODULE (daw, m)
     // --- transport (fire-and-forget; Python doesn't need to block) ---
     m.def ("play",  [] { juce::MessageManager::callAsync ([] { g_pyEdit->getTransport().play (false); }); });
     m.def ("stop",  [] { juce::MessageManager::callAsync ([] { g_pyEdit->getTransport().stop (false, false); }); });
-    m.def ("bpm",   [] -> double { return g_pyEdit->tempoSequence.getTempo (0)->getBpm(); });
+    m.def ("bpm",   []() -> double { return g_pyEdit->tempoSequence.getTempo (0)->getBpm(); });
     m.def ("set_bpm", [] (double bpm) {
         juce::MessageManager::callAsync ([bpm] { g_pyEdit->tempoSequence.getTempo (0)->setBpm (bpm); });
     });
-    m.def ("position", [] -> double {
+    m.def ("position", []() -> double {
         return g_pyEdit->getTransport().getPosition().inSeconds();
     });
-    m.def ("playing", [] -> bool { return g_pyEdit->getTransport().isPlaying(); });
+    m.def ("playing", []() -> bool { return g_pyEdit->getTransport().isPlaying(); });
 
     // --- track proxy ---
     py::class_<PyTrack> (m, "Track")

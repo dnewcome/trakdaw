@@ -17,18 +17,35 @@ set(TE_ADD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(vendor/tracktion_engine)
 
 # ---------------------------------------------------------------------------
-# LuaJIT — use system installation
+# LuaJIT — pkg-config on Linux, manual paths on Windows
 # ---------------------------------------------------------------------------
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LUAJIT REQUIRED luajit)
+if(WIN32)
+    set(LUAJIT_DIR "${CMAKE_SOURCE_DIR}/vendor/LuaJIT/src")
+    set(LUAJIT_INCLUDE_DIRS "${LUAJIT_DIR}")
+    set(LUAJIT_LIBRARIES "${LUAJIT_DIR}/lua51.lib")
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LUAJIT REQUIRED luajit)
+endif()
 
 # ---------------------------------------------------------------------------
-# Python + pybind11 — use pyenv Python; pybind11 installed via pip
+# Python + pybind11 — pyenv on Linux, auto-detect on Windows
 # ---------------------------------------------------------------------------
-set(Python3_ROOT_DIR "$ENV{HOME}/.pyenv/versions/3.12.9")
+if(NOT WIN32)
+    set(Python3_ROOT_DIR "$ENV{HOME}/.pyenv/versions/3.12.9")
+endif()
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-find_package(pybind11 CONFIG REQUIRED
-    HINTS "${Python3_ROOT_DIR}/lib/python3.12/site-packages/pybind11/share/cmake/pybind11")
+
+# Ask the active Python where pybind11 installed its CMake config
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import pybind11, sys; sys.stdout.write(pybind11.get_cmake_dir())"
+    OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE PYBIND11_CMAKE_DIR_RESULT)
+if(NOT PYBIND11_CMAKE_DIR_RESULT EQUAL 0)
+    message(FATAL_ERROR "pybind11 not found via Python ${Python3_EXECUTABLE}. Run: ${Python3_EXECUTABLE} -m pip install pybind11")
+endif()
+find_package(pybind11 CONFIG REQUIRED HINTS "${PYBIND11_CMAKE_DIR}")
 
 # ---------------------------------------------------------------------------
 # trakdaw
@@ -63,10 +80,14 @@ target_compile_definitions(trakdaw PRIVATE
     JUCE_MODAL_LOOPS_PERMITTED=1
     TRACKTION_ENABLE_TIMESTRETCH_SOUNDTOUCH=0
     SOL_ALL_SAFETIES_ON=1
-    JUCE_USE_WINRT_MIDI=0
-    JUCE_JACK=1
-    JUCE_ALSA=1               # also gates Linux MIDI (juce_Midi_linux.cpp)
-    JUCE_PULSEAUDIO=0)
+    JUCE_USE_WINRT_MIDI=0)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(trakdaw PRIVATE
+        JUCE_JACK=1
+        JUCE_ALSA=1               # also gates Linux MIDI (juce_Midi_linux.cpp)
+        JUCE_PULSEAUDIO=0)
+endif()
 
 target_link_libraries(trakdaw PRIVATE
     tracktion::tracktion_engine
@@ -90,3 +111,11 @@ endif()
 # system dep. Replaces GNU readline; closes the cross-platform-REPL part of #1.
 target_sources(trakdaw PRIVATE vendor/isocline/src/isocline.c)
 target_include_directories(trakdaw PRIVATE vendor/isocline/include)
+
+# Windows: copy lua51.dll next to the built exe (LuaJIT is built as a DLL).
+if(WIN32)
+    add_custom_command(TARGET trakdaw POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LUAJIT_DIR}/lua51.dll"
+            "$<TARGET_FILE_DIR:trakdaw>/lua51.dll")
+endif()
